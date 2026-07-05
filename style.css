@@ -1,0 +1,25 @@
+#st_cache_helper_panel {
+  border: 1px solid var(--SmartThemeBorderColor, #444);
+  border-radius: 8px;
+  padding: 8px;
+  margin: 8px 0;
+  background: var(--SmartThemeBlurTintColor, rgba(0,0,0,.12));
+  font-size: 0.9em;
+}
+#st_cache_helper_panel .stch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+#st_cache_helper_panel .stch-muted {
+  opacity: .75;
+  font-size: .9em;
+  line-height: 1.35;
+}
+#st_cache_helper_panel select {
+  flex: 1;
+}
+#st_cache_helper_panel code {
+  font-size: .9em;
+}
