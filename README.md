@@ -1,58 +1,54 @@
 # ST Cache Helper
 
-SillyTavern 本地第三方扩展，用于改善 `提示词后处理 = 严格 / Strict` 时 Claude / NewAPI 链路的 prompt cache 命中问题。
+SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 prompt cache 命中问题。
 
-## 作用
+## 核心功能
 
-SillyTavern 的 `Strict` 后处理会把多段 system 合并，并可能插入 `[Start a new chat]` 占位消息。对于 Claude prompt cache，这会让稳定前缀变动，导致缓存反复写入但无法读取。
-
-本扩展在浏览器前端拦截发往：
+本扩展会在浏览器前端拦截 SillyTavern 发往：
 
 ```text
 /api/backends/chat-completions/generate
 ```
 
-的请求，并默认把：
+的请求，并在不修改 SillyTavern 后端源码、不修改 NewAPI 的情况下做缓存友好化处理。
+
+当前默认策略为：
 
 ```text
-strict       -> merge
-strict_tools -> merge_tools
+稳定前缀缓存修复 stable_prefix_cache
 ```
 
-从而尽量保留更稳定的前缀结构，提高缓存命中率。
+它会：
+
+- 把稳定的 `system` 提示词固定到请求最前面；
+- 把 ST 中后段静态提示词提前为稳定前缀，避免随聊天轮次滑动；
+- 自动识别并补回“预设里显示存在、但实际没进请求体”的自定义 `system_prompt: true` 提示词；
+- 避免 Strict 后处理重新移动提示词；
+- 给请求加可选调试头：`X-ST-Cache-Helper: stable-prefix-cache-v1`。
+
+## 为什么需要它
+
+SillyTavern 的某些 OpenAI/Claude 预设组合下，常见问题是：
+
+- `Strict` 后处理会移动或改写 system 块；
+- depth 注入块可能随对话轮次滑动；
+- 某些导入预设的自定义 `system_prompt: true` 模块会显示在 Prompt Manager 里，但不会进入最终请求体；
+- 静态 assistant/user 提示词可能混在聊天历史后面，导致 Claude prompt cache 只写不读。
+
+本扩展的目标是让角色卡、世界书、长预设、样例等稳定前缀尽量保持一致，从而提高后续请求的 `cache_tokens`。
 
 ## 安装方法
-
-### 方法 1：放到当前用户扩展目录
 
 进入 SillyTavern 目录：
 
 ```bash
 cd /path/to/SillyTavern
-```
-
-创建本地扩展目录：
-
-```bash
 mkdir -p data/default-user/extensions
-```
-
-把本仓库克隆进去：
-
-```bash
 git clone https://github.com/haveagoodday1205-png/st-cache-helper.git \
   data/default-user/extensions/st-cache-helper
 ```
 
 然后重启 SillyTavern，刷新浏览器页面。
-
-### 方法 2：手动复制
-
-把整个 `st-cache-helper` 文件夹复制到：
-
-```text
-SillyTavern/data/default-user/extensions/st-cache-helper
-```
 
 目录结构应为：
 
@@ -64,38 +60,18 @@ st-cache-helper/
 └─ README.md
 ```
 
-然后重启 SillyTavern，刷新页面。
-
-## 使用方法
-
-进入 SillyTavern 后，在扩展列表中应看到：
-
-```text
-ST Cache Helper
-```
-
-默认配置：
+## 默认设置
 
 ```text
 启用请求修复：开
-策略：Strict → Merge
+策略：稳定前缀缓存修复
 仅作用于自定义 OpenAI 源：开
 控制台调试日志：开
+给请求加调试头：开
+自动补回丢失的自定义 system 提示词：开
 ```
 
-推荐保持默认：
-
-```text
-Strict → Merge
-```
-
-如果想更接近 Strict 行为，可以试：
-
-```text
-Strict → Semi
-```
-
-## 验证是否加载
+## 验证是否生效
 
 浏览器控制台应出现：
 
@@ -103,15 +79,22 @@ Strict → Semi
 [ST Cache Helper] loaded
 ```
 
-发送请求时，如果发生改写，会出现：
+发送请求时，如果发生优化，会出现类似：
 
 ```text
-[ST Cache Helper] post-processing rewritten
+[ST Cache Helper] optimized request
+```
+
+理想状态下，配合 NewAPI 日志应看到第二轮开始：
+
+```text
+cache_tokens 很高
+cache_creation_tokens 很低
 ```
 
 ## 注意
 
+- 这是前端请求级修复。
 - 不修改 NewAPI。
 - 不修改 SillyTavern 后端源码。
-- 只在前端发送请求前改写请求体。
-- 默认只作用于 `自定义 OpenAI / custom` 来源。
+- 不能保证所有动态预设 100% 命中缓存；如果预设每轮把时间、随机数、summary、动态世界书放到前缀，仍可能降低缓存命中。
