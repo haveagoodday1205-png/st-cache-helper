@@ -24,6 +24,7 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 - 把 ST 中后段静态提示词提前为稳定前缀，避免随聊天轮次滑动；
 - 自动识别并补回“预设里显示存在、但实际没进请求体”的自定义 `system_prompt: true` 提示词；
 - 避免 Strict 后处理重新移动提示词；
+- 可选为自定义 OpenAI 的 Claude 模型请求 `1h` 缓存，并在稳定 system 前缀末尾写入标准 Anthropic `cache_control` 断点；
 - 给请求加可选调试头：`X-ST-Cache-Helper: stable-prefix-cache-v4`。
 
 ## 为什么需要它
@@ -69,6 +70,7 @@ st-cache-helper/
 控制台调试日志：开
 给请求加调试头：开
 自动补回丢失的自定义 system 提示词：开
+请求 Claude 1 小时缓存：关
 ```
 
 ## 验证是否生效
@@ -120,3 +122,10 @@ cache_creation_tokens 很低
 ## 0.8.1
 
 - 修正稳定世界书顺序记忆范围：开头主预设/角色卡 system 不再参与 depth/lore 顺序记忆，避免长期跨角色排序影响角色卡原始顺序；只有聊天中段/深度插入的稳定 system 和 user/assistant lore 会参与。
+
+## 0.9.0
+
+- 新增可选的 Claude 1 小时缓存请求：仅处理自定义 OpenAI 且模型名包含 `claude` 的请求。
+- 在稳定 system 前缀最后一个文本块注入 `cache_control: { type: "ephemeral", ttl: "1h" }`。
+- 自动合并 `prompt-caching-2024-07-31` 与 `extended-cache-ttl-2025-04-11` beta header。
+- 该选项默认关闭；是否产生 `ephemeral_1h_input_tokens` 由上游代理的协议转换和实际 Claude 渠道决定。

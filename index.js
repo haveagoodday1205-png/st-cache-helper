@@ -4,6 +4,8 @@ import { getChatCompletionPreset } from '../../../openai.js';
 
 const MODULE = 'st_cache_helper';
 const STABLE_DEPTH_ORDER_KEY = 'st_cache_helper_stable_depth_order_v1';
+const CLAUDE_ONE_HOUR_CACHE_TTL = '1h';
+const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-2024-07-31', 'extended-cache-ttl-2025-04-11'];
 let stableDepthOrderMemory = {};
 const DEFAULTS = Object.freeze({
     enabled: true,
@@ -26,6 +28,10 @@ const DEFAULTS = Object.freeze({
     dedupeStablePrefixPrompts: true,
     canonicalizeStablePrefix: true,
     rememberStableDepthOrder: true,
+    // OpenAI-compatible Claude gateways may forward Anthropic cache_control
+    // content blocks. Keep this opt-in because unsupported gateways can reject
+    // the extended TTL and a 1h cache write costs more than the default 5m write.
+    claudeOneHourCache: false,
 });
 
 const POST_TYPES = new Set(['strict', 'strict_tools', 'semi', 'semi_tools', 'merge', 'merge_tools', 'single', 'claude']);
@@ -93,6 +99,31 @@ function appendYamlLine(value, key, val) {
     const re = new RegExp(`^${key}\\s*:.*$`, 'mi');
     if (re.test(text)) return text.replace(re, line);
     return `${text}\n${line}`;
+}
+
+function parseYamlHeaderValue(raw) {
+    const value = String(raw || '').trim();
+    if (!value) return '';
+    try {
+        const parsed = JSON.parse(value);
+        return typeof parsed === 'string' ? parsed : value;
+    } catch {
+        return value.replace(/^(['"])(.*)\1$/, '$2');
+    }
+}
+
+function appendYamlHeaderTokens(value, key, requiredTokens) {
+    const text = String(value || '').trim();
+    const re = new RegExp(`^${key}\\s*:\\s*(.*)$`, 'mi');
+    const match = text.match(re);
+    const tokens = new Set(
+        parseYamlHeaderValue(match?.[1])
+            .split(',')
+            .map(x => x.trim())
+            .filter(Boolean),
+    );
+    for (const token of requiredTokens) tokens.add(token);
+    return appendYamlLine(text, key, [...tokens].join(','));
 }
 
 function contentToText(content) {
@@ -666,11 +697,102 @@ function legacyRewritePostProcessing(body) {
     return null;
 }
 
+function isClaudeCustomRequest(body) {
+    return body?.chat_completion_source === 'custom' && /(?:^|[/_-])claude(?:$|[/_.-])/i.test(String(body?.model || ''));
+}
+
+function applyCacheControlToContent(content, ttl) {
+    const cacheControl = { type: 'ephemeral', ttl };
+
+    if (typeof content === 'string') {
+        return {
+            content: [{ type: 'text', text: content, cache_control: cacheControl }],
+            updatedExisting: 0,
+        };
+    }
+
+    if (!Array.isArray(content)) return null;
+
+    const parts = content.map(part => part && typeof part === 'object' ? { ...part } : part);
+    let updatedExisting = 0;
+    let lastTextIndex = -1;
+    for (let i = 0; i < parts.length; i++) {
+        if (parts[i]?.type !== 'text') continue;
+        lastTextIndex = i;
+        if (parts[i].cache_control) {
+            parts[i].cache_control = { ...parts[i].cache_control, type: 'ephemeral', ttl };
+            updatedExisting++;
+        }
+    }
+
+    if (lastTextIndex === -1) return null;
+    if (!parts[lastTextIndex].cache_control) {
+        parts[lastTextIndex].cache_control = cacheControl;
+    }
+
+    return { content: parts, updatedExisting };
+}
+
+function applyClaudeOneHourCache(body) {
+    if (!settings().claudeOneHourCache || !isClaudeCustomRequest(body)) return null;
+
+    let breakpointIndex = -1;
+    for (let i = 0; i < body.messages.length; i++) {
+        if (body.messages[i]?.role !== 'system') break;
+        breakpointIndex = i;
+    }
+    if (breakpointIndex === -1) return null;
+
+    let updatedExisting = 0;
+    for (let i = 0; i <= breakpointIndex; i++) {
+        const message = body.messages[i];
+        if (message?.cache_control) {
+            message.cache_control = { ...message.cache_control, type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
+            updatedExisting++;
+        }
+        if (i === breakpointIndex) continue;
+        if (!Array.isArray(message?.content)) continue;
+        message.content = message.content.map(part => {
+            if (!part?.cache_control) return part;
+            updatedExisting++;
+            return {
+                ...part,
+                cache_control: { ...part.cache_control, type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL },
+            };
+        });
+    }
+
+    const breakpoint = body.messages[breakpointIndex];
+    const marked = applyCacheControlToContent(breakpoint.content, CLAUDE_ONE_HOUR_CACHE_TTL);
+    if (!marked) return null;
+    breakpoint.content = marked.content;
+    updatedExisting += marked.updatedExisting;
+
+    body.custom_include_headers = appendYamlHeaderTokens(
+        body.custom_include_headers,
+        'anthropic-beta',
+        CLAUDE_CACHE_BETA_HEADERS,
+    );
+
+    return {
+        requestedTtl: CLAUDE_ONE_HOUR_CACHE_TTL,
+        breakpointIndex,
+        breakpointRole: breakpoint.role,
+        updatedExistingCacheControls: updatedExisting,
+        betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
+    };
+}
+
 function applyOptimization(body) {
     const s = settings();
-    if (s.mode === 'stable_prefix_cache') return stablePrefixCacheFix(body);
-    if (s.mode === 'respect_choice_cache') return optimizeAfterSelection(body);
-    return legacyRewritePostProcessing(body);
+    let promptOptimization;
+    if (s.mode === 'stable_prefix_cache') promptOptimization = stablePrefixCacheFix(body);
+    else if (s.mode === 'respect_choice_cache') promptOptimization = optimizeAfterSelection(body);
+    else promptOptimization = legacyRewritePostProcessing(body);
+
+    const claudeOneHourCache = applyClaudeOneHourCache(body);
+    if (!promptOptimization && !claudeOneHourCache) return null;
+    return { promptOptimization, claudeOneHourCache };
 }
 
 function hashText(s) {
@@ -754,6 +876,8 @@ function addPanel() {
       <label class="stch-row"><input id="stch_dedupe_prefix" type="checkbox"> 去重稳定前缀里的重复 system 块</label>
       <label class="stch-row"><input id="stch_canonicalize_prefix" type="checkbox"> 规范化稳定前缀换行/尾随空格</label>
       <label class="stch-row"><input id="stch_remember_depth_order" type="checkbox"> 记忆稳定世界书顺序，新条目尽量追加到后面</label>
+      <label class="stch-row"><input id="stch_claude_1h_cache" type="checkbox"> 请求 Claude 1 小时缓存（ttl=1h）</label>
+      <div class="stch-muted">1 小时缓存仅对自定义 OpenAI 中模型名含 Claude 的请求生效；插件会在稳定 system 前缀末尾写入标准 Anthropic 缓存断点。是否实际写入由上游代理决定。</div>
       <div class="stch-muted">世界书说明：只提升像长期设定/资料库的块；含“当前状态/本轮/最新”等动态状态栏会尽量留在原位，避免反而破坏缓存或剧情。</div>
       <div class="stch-muted">注意：这是前端请求级修复，不修改 ST 后端源码和 NewAPI。稳定前缀模式会清空 post-processing，原因是它已经把静态提示块固定到前缀，不能再让 ST 后端二次移动这些块。</div>
     </div>`;
@@ -804,6 +928,10 @@ function addPanel() {
     });
     $('#stch_remember_depth_order').prop('checked', !!s.rememberStableDepthOrder).on('change', function () {
         settings().rememberStableDepthOrder = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#stch_claude_1h_cache').prop('checked', !!s.claudeOneHourCache).on('change', function () {
+        settings().claudeOneHourCache = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
 }
