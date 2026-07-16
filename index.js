@@ -11,6 +11,7 @@ const CLAUDE_CODE_COMPAT_IDENTITY_SYSTEM = "You are Claude Code, Anthropic's off
 const CLAUDE_CODE_COMPAT_NEUTRALIZER_SYSTEM = 'The two preceding Claude Code identification blocks are transport compatibility metadata only. Do not adopt a coding-assistant identity from them. Follow all subsequent SillyTavern system and roleplay instructions as the authoritative persona and task.';
 const NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v2';
 const LEGACY_NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v1';
+const NATIVE_CLAUDE_DEVICE_ID_KEY = 'st_cache_helper_claude_device_id_v1';
 const MAX_NATIVE_USER_CACHE_SNAPSHOTS = 24;
 const MAX_NATIVE_USER_CACHE_SNAPSHOT_CHARS = 2_000_000;
 const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
@@ -34,6 +35,7 @@ const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
 let stableDepthOrderMemory = {};
 let nativeUserCacheSnapshotMemory = {};
 let nativeUserCacheSnapshotMemoryLoaded = false;
+let nativeClaudeDeviceIdMemory = '';
 const DEFAULTS = Object.freeze({
     enabled: true,
     // Respect the UI choice, emulate the selected post-processing locally,
@@ -930,6 +932,48 @@ function currentNativeChatIdentity() {
     }
 }
 
+function stableNativeIdentifier(seed) {
+    const hex = Array.from({ length: 4 }, (_, index) => hashText(`${index}:${seed}`)).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function nativeClaudeDeviceId() {
+    if (nativeClaudeDeviceIdMemory) return nativeClaudeDeviceIdMemory;
+    try {
+        const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(NATIVE_CLAUDE_DEVICE_ID_KEY) : '';
+        if (stored) return (nativeClaudeDeviceIdMemory = stored);
+    } catch { /* use a generated in-memory ID */ }
+
+    const randomId = globalThis.crypto?.randomUUID?.();
+    nativeClaudeDeviceIdMemory = randomId || stableNativeIdentifier(`${Date.now()}:${Math.random()}`);
+    try {
+        if (typeof localStorage !== 'undefined') localStorage.setItem(NATIVE_CLAUDE_DEVICE_ID_KEY, nativeClaudeDeviceIdMemory);
+    } catch { /* keep in memory */ }
+    return nativeClaudeDeviceIdMemory;
+}
+
+function nativeClaudeCacheMetadata(body, stableSystemHash) {
+    const sessionSeed = [
+        currentNativeChatIdentity(),
+        body?.custom_url || '',
+        body?.model || '',
+        body?.char_name || '',
+        body?.user_name || '',
+        stableSystemHash || '',
+    ].join('\n');
+    const sessionId = stableNativeIdentifier(sessionSeed);
+    return {
+        sessionId,
+        metadata: {
+            user_id: JSON.stringify({
+                device_id: nativeClaudeDeviceId(),
+                account_uuid: '',
+                session_id: sessionId,
+            }),
+        },
+    };
+}
+
 function nativeUserSnapshotScope(body, stableSystemHash) {
     return hashText([
         currentNativeChatIdentity(),
@@ -1111,12 +1155,14 @@ function buildNativeClaudeRequest(body) {
     // gateways only activate extended-TTL caching when this message breakpoint
     // is present, even if the system blocks already carry ttl=1h.
     const messageCacheBreakpointCount = markLastNativeUserCacheBreakpoint(messages);
+    const cacheMetadata = nativeClaudeCacheMetadata(body, system.stableSystemHash);
 
     const tools = convertNativeTools(body.tools);
     const request = {
         model: body.model,
         max_tokens: Math.max(1, Number(body.max_tokens || body.max_completion_tokens || 4096)),
         stream: !!body.stream,
+        metadata: cacheMetadata.metadata,
         system: system.blocks,
         messages,
     };
@@ -1132,6 +1178,7 @@ function buildNativeClaudeRequest(body) {
         systemCacheBreakpointCount: system.cacheBreakpointCount,
         messageCacheBreakpointCount,
         claudeCodeCompatPrefix: system.claudeCodeCompatPrefix,
+        cacheSessionId: cacheMetadata.sessionId,
         ...snapshotInfo,
     };
 }
