@@ -827,6 +827,21 @@ function buildNativeMessages(messages, leadingSystemMessages, model) {
     return out;
 }
 
+function markLastNativeUserCacheBreakpoint(messages) {
+    const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
+    for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+        const message = messages[messageIndex];
+        if (message?.role !== 'user' || !Array.isArray(message.content)) continue;
+        for (let partIndex = message.content.length - 1; partIndex >= 0; partIndex--) {
+            const part = message.content[partIndex];
+            if (!part || typeof part !== 'object') continue;
+            message.content[partIndex] = { ...part, cache_control: cacheControl };
+            return 1;
+        }
+    }
+    return 0;
+}
+
 function convertNativeTools(tools) {
     if (!Array.isArray(tools)) return [];
     return tools.map(tool => {
@@ -862,6 +877,10 @@ function buildNativeClaudeRequest(body) {
     if (!system || system.cacheBreakpointCount < 2) return null;
     const messages = buildNativeMessages(body.messages, system.leadingSystemMessages, body.model);
     if (!messages) return null;
+    // Claude Code also marks the newest user-side content block. Some Claude
+    // gateways only activate extended-TTL caching when this message breakpoint
+    // is present, even if the system blocks already carry ttl=1h.
+    const messageCacheBreakpointCount = markLastNativeUserCacheBreakpoint(messages);
 
     const tools = convertNativeTools(body.tools);
     const request = {
@@ -877,7 +896,12 @@ function buildNativeClaudeRequest(body) {
         const toolChoice = convertNativeToolChoice(body.tool_choice);
         if (toolChoice) request.tool_choice = toolChoice;
     }
-    return { request, cacheBreakpointCount: system.cacheBreakpointCount };
+    return {
+        request,
+        cacheBreakpointCount: system.cacheBreakpointCount + messageCacheBreakpointCount,
+        systemCacheBreakpointCount: system.cacheBreakpointCount,
+        messageCacheBreakpointCount,
+    };
 }
 
 function buildNativeClaudeTunnelUrl(customUrl) {
@@ -971,6 +995,8 @@ function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
             originalCustomUrl,
             nativeEndpoint: nativeUrl,
             cacheBreakpointCount: native.cacheBreakpointCount,
+            systemCacheBreakpointCount: native.systemCacheBreakpointCount,
+            messageCacheBreakpointCount: native.messageCacheBreakpointCount,
             betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
         };
     }

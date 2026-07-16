@@ -142,6 +142,11 @@ cache_creation.ephemeral_1h_input_tokens > 0
 
 - 按 Claude Code `ENABLE_PROMPT_CACHING_1H=1` 的真实请求形态重做一小时缓存：使用 `prompt-caching-scope-2026-01-05` 与 `extended-cache-ttl-2025-04-11`。
 - 自定义 OpenAI 请求会通过同一网关的原生 `/v1/messages` 路径发送，绕过 NewAPI 在 OpenAI → Claude 转换时丢弃 `ttl` 的问题；密钥仍由 SillyTavern 后端读取，不进入浏览器设置。
-- 在稳定 system 前缀末尾放置两个 `cache_control: { type: "ephemeral", ttl: "1h" }` 断点；单个大 system 块会在稳定边界拆成两个内容块。
+- 在稳定 system 前缀末尾放置两个 `cache_control: { type: "ephemeral", ttl: "1h" }` 断点，并按 Claude Code 的请求形态给最后一条 user 内容增加第三个 1h 断点；单个大 system 块会在稳定边界拆成两个内容块。
 - 新增 Anthropic 原生响应转换：同时支持普通 JSON、SSE 文本流、thinking 和 tool use，酒馆前端仍按原 OpenAI-compatible 格式消费。
 - 图片、JSON Schema、Claude 4.6+ assistant prefill 等不适合原生隧道的请求会自动退回兼容注入模式。
+
+## 0.10.1
+
+- 补齐 Claude Code 的消息级缓存断点：除两个稳定 system 断点外，最后一条 user 内容也会标记 `ttl=1h`。
+- 修复部分 Claude Haiku / Claude Code 专用网关忽略仅有 system 断点、导致完全不写缓存的问题。
