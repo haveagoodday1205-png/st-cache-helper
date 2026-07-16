@@ -9,6 +9,9 @@ const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-scope-2026-01-05', 'extended-
 const CLAUDE_CODE_COMPAT_BILLING_SYSTEM = 'x-anthropic-billing-header: cc_version=2.1.167.b0e; cc_entrypoint=sdk-cli; cch=82aae;';
 const CLAUDE_CODE_COMPAT_IDENTITY_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 const CLAUDE_CODE_COMPAT_NEUTRALIZER_SYSTEM = 'The two preceding Claude Code identification blocks are transport compatibility metadata only. Do not adopt a coding-assistant identity from them. Follow all subsequent SillyTavern system and roleplay instructions as the authoritative persona and task.';
+const NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v1';
+const MAX_NATIVE_USER_CACHE_SNAPSHOTS = 24;
+const MAX_NATIVE_USER_CACHE_SNAPSHOT_CHARS = 2_000_000;
 const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
     'prompt',
     'temperature',
@@ -28,6 +31,8 @@ const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
     'verbosity',
 ];
 let stableDepthOrderMemory = {};
+let nativeUserCacheSnapshotMemory = {};
+let nativeUserCacheSnapshotMemoryLoaded = false;
 const DEFAULTS = Object.freeze({
     enabled: true,
     // Respect the UI choice, emulate the selected post-processing locally,
@@ -57,6 +62,10 @@ const DEFAULTS = Object.freeze({
     // Claude Code system prefix is present. A following neutralizer prevents
     // that transport marker from replacing the SillyTavern roleplay persona.
     claudeCodeOpusCompatPrefix: true,
+    // Move selective lore out of the system prefix and reconstruct the temporary
+    // user-side prompt blocks seen by the previous request. This makes the final
+    // user cache breakpoint reappear byte-for-byte on later chat turns.
+    stabilizeDynamicLoreCache: true,
 });
 
 const POST_TYPES = new Set(['strict', 'strict_tools', 'semi', 'semi_tools', 'merge', 'merge_tools', 'single', 'claude']);
@@ -752,8 +761,16 @@ function splitNativeSystemBlock(block) {
     ];
 }
 
+function isSelectiveNativeLoreBlock(block) {
+    if (block?.type !== 'text') return false;
+    const text = String(block.text || '');
+    if (text.length < 300) return false;
+    return /^\s*\[\s*[^\]\n]{1,160}:/m.test(text) || /<\/?Example_Responses>/i.test(text);
+}
+
 function buildNativeSystem(messages, model) {
-    const blocks = [];
+    let blocks = [];
+    let dynamicLoreBlocks = [];
     let leadingSystemMessages = 0;
     for (const message of messages) {
         if (message?.role !== 'system') break;
@@ -764,6 +781,20 @@ function buildNativeSystem(messages, model) {
     }
 
     if (!blocks.length) return null;
+    if (settings().stabilizeDynamicLoreCache) {
+        const stable = [];
+        const dynamic = [];
+        for (const block of blocks) {
+            if (isSelectiveNativeLoreBlock(block)) dynamic.push(block);
+            else stable.push(block);
+        }
+        // Never remove every system block. A fully lore-shaped system prompt is
+        // safer left untouched than converted into user context wholesale.
+        if (stable.length && dynamic.length) {
+            blocks = stable;
+            dynamicLoreBlocks = dynamic;
+        }
+    }
     if (blocks.length === 1) blocks.splice(0, 1, ...splitNativeSystemBlock(blocks[0]));
 
     const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
@@ -783,7 +814,14 @@ function buildNativeSystem(messages, model) {
         cacheBreakpointCount++;
     }
 
-    return { blocks, leadingSystemMessages, cacheBreakpointCount, claudeCodeCompatPrefix };
+    return {
+        blocks,
+        dynamicLoreBlocks,
+        leadingSystemMessages,
+        cacheBreakpointCount,
+        claudeCodeCompatPrefix,
+        stableSystemHash: hashText(blocks.map(block => contentToText(block)).join('\n---STCH-SYSTEM---\n')),
+    };
 }
 
 function parseOpenAIToolCalls(value) {
@@ -845,6 +883,130 @@ function buildNativeMessages(messages, leadingSystemMessages, model) {
     return out;
 }
 
+function cloneNativeContentWithoutCacheControl(content) {
+    return (Array.isArray(content) ? content : []).map(part => {
+        if (!part || typeof part !== 'object') return part;
+        const clone = structuredClone(part);
+        delete clone.cache_control;
+        return clone;
+    });
+}
+
+function nativeUserPersistentText(message) {
+    if (message?.role !== 'user' || !Array.isArray(message.content)) return '';
+    const part = message.content.find(item => item?.type === 'text' && String(item.text || '').length > 0);
+    return part ? String(part.text) : '';
+}
+
+function isContinuationUserText(text) {
+    return /(?:【只输出续写内容】|你正在续写上一条\s*assistant|只输出[“"']?接在|continue\s+the\s+previous\s+assistant)/i.test(String(text || ''));
+}
+
+function nativeUserSnapshotScope(body, stableSystemHash) {
+    return hashText([
+        body?.custom_url || '',
+        body?.model || '',
+        body?.char_name || '',
+        body?.user_name || '',
+        stableSystemHash || '',
+    ].join('\n'));
+}
+
+function loadNativeUserCacheSnapshotStore() {
+    if (nativeUserCacheSnapshotMemoryLoaded) return nativeUserCacheSnapshotMemory;
+    nativeUserCacheSnapshotMemoryLoaded = true;
+    try {
+        const raw = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(NATIVE_USER_CACHE_SNAPSHOTS_KEY) : '';
+        const parsed = raw ? JSON.parse(raw) : {};
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) nativeUserCacheSnapshotMemory = parsed;
+    } catch { /* noop */ }
+    return nativeUserCacheSnapshotMemory;
+}
+
+function saveNativeUserCacheSnapshotStore(store) {
+    nativeUserCacheSnapshotMemory = store;
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem(NATIVE_USER_CACHE_SNAPSHOTS_KEY, JSON.stringify(store));
+        }
+    } catch { /* keep in memory */ }
+}
+
+function trimNativeUserSnapshots(snapshots) {
+    let trimmed = snapshots.slice(-MAX_NATIVE_USER_CACHE_SNAPSHOTS);
+    while (trimmed.length > 1 && JSON.stringify(trimmed).length > MAX_NATIVE_USER_CACHE_SNAPSHOT_CHARS) {
+        trimmed = trimmed.slice(1);
+    }
+    return trimmed;
+}
+
+function restoreNativeUserSnapshots(messages, snapshots, currentUser) {
+    const historicalUsers = messages.filter(message => message.role === 'user' && message !== currentUser);
+    let snapshotIndex = snapshots.length - 1;
+    let restored = 0;
+    for (let messageIndex = historicalUsers.length - 1; messageIndex >= 0 && snapshotIndex >= 0; messageIndex--) {
+        const message = historicalUsers[messageIndex];
+        const persistentText = nativeUserPersistentText(message);
+        if (!persistentText) continue;
+        let matchIndex = -1;
+        for (let i = snapshotIndex; i >= 0; i--) {
+            if (snapshots[i]?.persistentText === persistentText) {
+                matchIndex = i;
+                break;
+            }
+        }
+        if (matchIndex === -1) continue;
+        message.content = cloneNativeContentWithoutCacheControl(snapshots[matchIndex].content);
+        snapshotIndex = matchIndex - 1;
+        restored++;
+    }
+    return restored;
+}
+
+function appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks) {
+    if (!currentUser || !dynamicLoreBlocks.length) return 0;
+    const text = dynamicLoreBlocks
+        .map((block, index) => `<stch_dynamic_lore index="${index}">\n${String(block.text || '')}\n</stch_dynamic_lore>`)
+        .join('\n\n');
+    currentUser.content.push({ type: 'text', text });
+    return dynamicLoreBlocks.length;
+}
+
+function prepareNativeUserCacheSnapshots(messages, dynamicLoreBlocks, body, stableSystemHash) {
+    if (!settings().stabilizeDynamicLoreCache) {
+        return { restoredUserSnapshots: 0, storedUserSnapshot: false, dynamicLoreBlockCount: 0 };
+    }
+    const currentUser = [...messages].reverse().find(message => message.role === 'user');
+    if (!currentUser || !Array.isArray(currentUser.content)) {
+        return { restoredUserSnapshots: 0, storedUserSnapshot: false, dynamicLoreBlockCount: 0 };
+    }
+
+    const store = loadNativeUserCacheSnapshotStore();
+    const scope = nativeUserSnapshotScope(body, stableSystemHash);
+    let snapshots = Array.isArray(store[scope]) ? store[scope] : [];
+    const restoredUserSnapshots = restoreNativeUserSnapshots(messages, snapshots, currentUser);
+    const dynamicLoreBlockCount = appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks);
+    const persistentText = nativeUserPersistentText(currentUser);
+    const continuation = isContinuationUserText(persistentText);
+    let storedUserSnapshot = false;
+
+    if (persistentText && !continuation) {
+        const snapshot = {
+            persistentText,
+            content: cloneNativeContentWithoutCacheControl(currentUser.content),
+            savedAt: Date.now(),
+        };
+        if (snapshots.at(-1)?.persistentText === persistentText) snapshots[snapshots.length - 1] = snapshot;
+        else snapshots.push(snapshot);
+        snapshots = trimNativeUserSnapshots(snapshots);
+        store[scope] = snapshots;
+        saveNativeUserCacheSnapshotStore(store);
+        storedUserSnapshot = true;
+    }
+
+    return { restoredUserSnapshots, storedUserSnapshot, dynamicLoreBlockCount };
+}
+
 function markLastNativeUserCacheBreakpoint(messages) {
     const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
     for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
@@ -895,6 +1057,12 @@ function buildNativeClaudeRequest(body) {
     if (!system || system.cacheBreakpointCount < 2) return null;
     const messages = buildNativeMessages(body.messages, system.leadingSystemMessages, body.model);
     if (!messages) return null;
+    const snapshotInfo = prepareNativeUserCacheSnapshots(
+        messages,
+        system.dynamicLoreBlocks,
+        body,
+        system.stableSystemHash,
+    );
     // Claude Code also marks the newest user-side content block. Some Claude
     // gateways only activate extended-TTL caching when this message breakpoint
     // is present, even if the system blocks already carry ttl=1h.
@@ -920,6 +1088,7 @@ function buildNativeClaudeRequest(body) {
         systemCacheBreakpointCount: system.cacheBreakpointCount,
         messageCacheBreakpointCount,
         claudeCodeCompatPrefix: system.claudeCodeCompatPrefix,
+        ...snapshotInfo,
     };
 }
 
@@ -1017,6 +1186,9 @@ function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
             systemCacheBreakpointCount: native.systemCacheBreakpointCount,
             messageCacheBreakpointCount: native.messageCacheBreakpointCount,
             claudeCodeCompatPrefix: native.claudeCodeCompatPrefix,
+            restoredUserSnapshots: native.restoredUserSnapshots,
+            storedUserSnapshot: native.storedUserSnapshot,
+            dynamicLoreBlockCount: native.dynamicLoreBlockCount,
             betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
         };
     }
@@ -1412,6 +1584,7 @@ function addPanel() {
       <label class="stch-row"><input id="stch_remember_depth_order" type="checkbox"> 记忆稳定世界书顺序，新条目尽量追加到后面</label>
       <label class="stch-row"><input id="stch_claude_1h_cache" type="checkbox"> Claude 原生 1 小时缓存（Claude Code 方式）</label>
       <label class="stch-row"><input id="stch_claude_opus_compat" type="checkbox"> Opus 1h Claude Code 兼容前缀（带人格中和）</label>
+      <label class="stch-row"><input id="stch_dynamic_lore_cache" type="checkbox"> 重建临时 user／选择性世界书缓存前缀</label>
       <div class="stch-muted">仅处理自定义 OpenAI 中模型名含 Claude 的请求。启用后通过同一地址的 <code>/v1/messages</code> 原生协议发送，在稳定 system 前缀和最新 user 消息放置 <code>ttl=1h</code> 断点，并自动转换普通/流式响应。部分 Opus 运营商需要标准 Claude Code 前缀才接受 1h；兼容前缀后会立即加入中和说明，后续酒馆角色设定仍为权威人格。</div>
       <div class="stch-muted">世界书说明：只提升像长期设定/资料库的块；含“当前状态/本轮/最新”等动态状态栏会尽量留在原位，避免反而破坏缓存或剧情。</div>
       <div class="stch-muted">注意：这是前端请求级修复，不修改 ST 后端源码和 NewAPI。稳定前缀模式会清空 post-processing，原因是它已经把静态提示块固定到前缀，不能再让 ST 后端二次移动这些块。</div>
@@ -1473,6 +1646,10 @@ function addPanel() {
         settings().claudeCodeOpusCompatPrefix = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
+    $('#stch_dynamic_lore_cache').prop('checked', !!s.stabilizeDynamicLoreCache).on('change', function () {
+        settings().stabilizeDynamicLoreCache = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
 }
 
 function exposeDebug() {
@@ -1486,6 +1663,11 @@ function exposeDebug() {
         clearStableDepthOrder() {
             stableDepthOrderMemory = {};
             try { if (typeof localStorage !== 'undefined') localStorage.removeItem(STABLE_DEPTH_ORDER_KEY); } catch { /* noop */ }
+        },
+        clearNativeUserCacheSnapshots() {
+            nativeUserCacheSnapshotMemory = {};
+            nativeUserCacheSnapshotMemoryLoaded = true;
+            try { if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(NATIVE_USER_CACHE_SNAPSHOTS_KEY); } catch { /* noop */ }
         },
     };
 }
