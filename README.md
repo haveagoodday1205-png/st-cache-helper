@@ -24,7 +24,7 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 - 把 ST 中后段静态提示词提前为稳定前缀，避免随聊天轮次滑动；
 - 自动识别并补回“预设里显示存在、但实际没进请求体”的自定义 `system_prompt: true` 提示词；
 - 避免 Strict 后处理重新移动提示词；
-- 可选为自定义 OpenAI 的 Claude 模型请求 `1h` 缓存，并在稳定 system 前缀末尾写入标准 Anthropic `cache_control` 断点；
+- 可选使用 Claude Code 同款原生请求形态，为自定义 OpenAI 的 Claude 模型写入 `1h` 缓存；
 - 给请求加可选调试头：`X-ST-Cache-Helper: stable-prefix-cache-v4`。
 
 ## 为什么需要它
@@ -70,7 +70,7 @@ st-cache-helper/
 控制台调试日志：开
 给请求加调试头：开
 自动补回丢失的自定义 system 提示词：开
-请求 Claude 1 小时缓存：关
+Claude 原生 1 小时缓存（Claude Code 方式）：关
 ```
 
 ## 验证是否生效
@@ -93,6 +93,14 @@ st-cache-helper/
 cache_tokens 很高
 cache_creation_tokens 很低
 ```
+
+启用“Claude 原生 1 小时缓存”后，首次写入还应在接口 usage / NewAPI 日志中看到：
+
+```text
+cache_creation.ephemeral_1h_input_tokens > 0
+```
+
+后续相同稳定前缀应出现 `cache_read_input_tokens > 0`。
 
 ## 注意
 
@@ -129,3 +137,11 @@ cache_creation_tokens 很低
 - 在稳定 system 前缀最后一个文本块注入 `cache_control: { type: "ephemeral", ttl: "1h" }`。
 - 自动合并 `prompt-caching-2024-07-31` 与 `extended-cache-ttl-2025-04-11` beta header。
 - 该选项默认关闭；是否产生 `ephemeral_1h_input_tokens` 由上游代理的协议转换和实际 Claude 渠道决定。
+
+## 0.10.0
+
+- 按 Claude Code `ENABLE_PROMPT_CACHING_1H=1` 的真实请求形态重做一小时缓存：使用 `prompt-caching-scope-2026-01-05` 与 `extended-cache-ttl-2025-04-11`。
+- 自定义 OpenAI 请求会通过同一网关的原生 `/v1/messages` 路径发送，绕过 NewAPI 在 OpenAI → Claude 转换时丢弃 `ttl` 的问题；密钥仍由 SillyTavern 后端读取，不进入浏览器设置。
+- 在稳定 system 前缀末尾放置两个 `cache_control: { type: "ephemeral", ttl: "1h" }` 断点；单个大 system 块会在稳定边界拆成两个内容块。
+- 新增 Anthropic 原生响应转换：同时支持普通 JSON、SSE 文本流、thinking 和 tool use，酒馆前端仍按原 OpenAI-compatible 格式消费。
+- 图片、JSON Schema、Claude 4.6+ assistant prefill 等不适合原生隧道的请求会自动退回兼容注入模式。

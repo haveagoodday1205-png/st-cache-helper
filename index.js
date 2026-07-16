@@ -5,7 +5,25 @@ import { getChatCompletionPreset } from '../../../openai.js';
 const MODULE = 'st_cache_helper';
 const STABLE_DEPTH_ORDER_KEY = 'st_cache_helper_stable_depth_order_v1';
 const CLAUDE_ONE_HOUR_CACHE_TTL = '1h';
-const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-2024-07-31', 'extended-cache-ttl-2025-04-11'];
+const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-scope-2026-01-05', 'extended-cache-ttl-2025-04-11'];
+const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
+    'prompt',
+    'temperature',
+    'max_completion_tokens',
+    'presence_penalty',
+    'frequency_penalty',
+    'top_p',
+    'top_k',
+    'stop',
+    'logit_bias',
+    'logprobs',
+    'top_logprobs',
+    'seed',
+    'n',
+    'response_format',
+    'reasoning_effort',
+    'verbosity',
+];
 let stableDepthOrderMemory = {};
 const DEFAULTS = Object.freeze({
     enabled: true,
@@ -28,9 +46,9 @@ const DEFAULTS = Object.freeze({
     dedupeStablePrefixPrompts: true,
     canonicalizeStablePrefix: true,
     rememberStableDepthOrder: true,
-    // OpenAI-compatible Claude gateways may forward Anthropic cache_control
-    // content blocks. Keep this opt-in because unsupported gateways can reject
-    // the extended TTL and a 1h cache write costs more than the default 5m write.
+    // Use the Anthropic-native /v1/messages transport, mirroring Claude Code's
+    // extended-TTL request shape. Keep this opt-in because it takes over custom
+    // request/response conversion and a 1h write costs more than the default 5m.
     claudeOneHourCache: false,
 });
 
@@ -701,6 +719,205 @@ function isClaudeCustomRequest(body) {
     return body?.chat_completion_source === 'custom' && /(?:^|[/_-])claude(?:$|[/_.-])/i.test(String(body?.model || ''));
 }
 
+function toNativeContentBlocks(content) {
+    if (typeof content === 'string') return [{ type: 'text', text: content }];
+    if (!Array.isArray(content)) return [];
+
+    return content.map(part => {
+        if (!part || typeof part !== 'object') return { type: 'text', text: String(part ?? '') };
+        const out = { ...part };
+        delete out.cache_control;
+        return out;
+    }).filter(part => part.type !== 'text' || String(part.text || '').length > 0);
+}
+
+function splitNativeSystemBlock(block) {
+    if (block?.type !== 'text' || typeof block.text !== 'string' || block.text.length < 2) return [block];
+    const target = Math.floor(block.text.length / 2);
+    let splitAt = block.text.lastIndexOf('\n', target);
+    if (splitAt < Math.floor(target * 0.5)) splitAt = block.text.indexOf('\n', target);
+    if (splitAt <= 0 || splitAt >= block.text.length) splitAt = block.text.lastIndexOf(' ', target);
+    if (splitAt <= 0 || splitAt >= block.text.length) splitAt = target;
+    if (splitAt <= 0 || splitAt >= block.text.length) return [block];
+    return [
+        { ...block, text: block.text.slice(0, splitAt) },
+        { ...block, text: block.text.slice(splitAt) },
+    ];
+}
+
+function buildNativeSystem(messages) {
+    const blocks = [];
+    let leadingSystemMessages = 0;
+    for (const message of messages) {
+        if (message?.role !== 'system') break;
+        leadingSystemMessages++;
+        for (const part of toNativeContentBlocks(message.content)) {
+            if (part.type === 'text') blocks.push(part);
+        }
+    }
+
+    if (!blocks.length) return null;
+    if (blocks.length === 1) blocks.splice(0, 1, ...splitNativeSystemBlock(blocks[0]));
+
+    const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
+    const cacheBreakpointCount = Math.min(2, blocks.length);
+    for (let i = blocks.length - cacheBreakpointCount; i < blocks.length; i++) {
+        blocks[i] = { ...blocks[i], cache_control: cacheControl };
+    }
+
+    return { blocks, leadingSystemMessages, cacheBreakpointCount };
+}
+
+function parseOpenAIToolCalls(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'string') return [];
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function buildNativeMessages(messages, leadingSystemMessages, model) {
+    const out = [];
+    const append = (role, blocks) => {
+        if (!blocks.length) blocks = [{ type: 'text', text: '...' }];
+        const previous = out[out.length - 1];
+        if (previous?.role === role) previous.content.push(...blocks);
+        else out.push({ role, content: blocks });
+    };
+
+    for (const message of messages.slice(leadingSystemMessages)) {
+        if (message?.role === 'tool') {
+            append('user', [{
+                type: 'tool_result',
+                tool_use_id: String(message.tool_call_id || ''),
+                content: contentToText(message.content),
+            }]);
+            continue;
+        }
+        if (!['user', 'assistant'].includes(message?.role)) continue;
+
+        const blocks = toNativeContentBlocks(message.content);
+        if (message.role === 'assistant') {
+            for (const toolCall of parseOpenAIToolCalls(message.tool_calls)) {
+                let input = {};
+                try {
+                    input = JSON.parse(toolCall?.function?.arguments || '{}');
+                } catch {
+                    input = {};
+                }
+                blocks.push({
+                    type: 'tool_use',
+                    id: String(toolCall?.id || ''),
+                    name: String(toolCall?.function?.name || ''),
+                    input,
+                });
+            }
+        }
+        append(message.role, blocks);
+    }
+
+    if (!out.length) out.push({ role: 'user', content: [{ type: 'text', text: "Let's get started." }] });
+    if (out[0].role !== 'user') out.unshift({ role: 'user', content: [{ type: 'text', text: '...' }] });
+
+    const noPrefillModel = /^claude-(?:opus-4-[6-8]|sonnet-4-6)/i.test(String(model || ''));
+    if (noPrefillModel && out[out.length - 1]?.role === 'assistant') return null;
+    return out;
+}
+
+function convertNativeTools(tools) {
+    if (!Array.isArray(tools)) return [];
+    return tools.map(tool => {
+        if (tool?.name && tool?.input_schema) return { ...tool };
+        if (tool?.type !== 'function' || !tool?.function?.name) return null;
+        return {
+            name: String(tool.function.name),
+            description: String(tool.function.description || ''),
+            input_schema: tool.function.parameters || { type: 'object', properties: {} },
+        };
+    }).filter(Boolean);
+}
+
+function convertNativeToolChoice(toolChoice) {
+    if (!toolChoice || toolChoice === 'auto') return { type: 'auto' };
+    if (toolChoice === 'required') return { type: 'any' };
+    if (toolChoice === 'none') return undefined;
+    const name = toolChoice?.function?.name || toolChoice?.name;
+    return name ? { type: 'tool', name: String(name) } : { type: 'auto' };
+}
+
+function canUseNativeClaudeTransport(body) {
+    const hasUnsupportedMedia = body.messages.some(message =>
+        (Array.isArray(message?.media) && message.media.length)
+        || (Array.isArray(message?.content) && message.content.some(part => part?.type && part.type !== 'text')),
+    );
+    return !body?.json_schema && !hasUnsupportedMedia;
+}
+
+function buildNativeClaudeRequest(body) {
+    if (!canUseNativeClaudeTransport(body)) return null;
+    const system = buildNativeSystem(body.messages);
+    if (!system || system.cacheBreakpointCount < 2) return null;
+    const messages = buildNativeMessages(body.messages, system.leadingSystemMessages, body.model);
+    if (!messages) return null;
+
+    const tools = convertNativeTools(body.tools);
+    const request = {
+        model: body.model,
+        max_tokens: Math.max(1, Number(body.max_tokens || body.max_completion_tokens || 4096)),
+        stream: !!body.stream,
+        system: system.blocks,
+        messages,
+    };
+    if (Array.isArray(body.stop) && body.stop.length) request.stop_sequences = body.stop;
+    if (tools.length) {
+        request.tools = tools;
+        const toolChoice = convertNativeToolChoice(body.tool_choice);
+        if (toolChoice) request.tool_choice = toolChoice;
+    }
+    return { request, cacheBreakpointCount: system.cacheBreakpointCount };
+}
+
+function buildNativeClaudeTunnelUrl(customUrl) {
+    try {
+        const url = new URL(String(customUrl || ''));
+        let pathname = url.pathname.replace(/\/+$/, '');
+        pathname = pathname.replace(/\/(?:chat\/completions|messages)$/i, '');
+        if (!/\/v1$/i.test(pathname)) pathname += '/v1';
+        url.pathname = `${pathname}/messages`.replace(/\/{2,}/g, '/');
+        url.hash = '';
+        url.searchParams.set('beta', 'true');
+        // SillyTavern appends /chat/completions to every custom URL. Keeping an
+        // open query value turns that suffix into harmless query data while the
+        // actual path remains /v1/messages.
+        url.searchParams.set('stch_path', '');
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
+function mergeExcludedBodyKeys(value, requiredKeys) {
+    const keys = new Set(requiredKeys);
+    const text = String(value || '').trim();
+    if (text) {
+        try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) parsed.forEach(key => keys.add(String(key)));
+            else if (typeof parsed === 'string') keys.add(parsed);
+            else if (parsed && typeof parsed === 'object') Object.keys(parsed).forEach(key => keys.add(key));
+        } catch {
+            for (const line of text.split(/\r?\n/)) {
+                const match = line.match(/^\s*(?:-\s*)?([\w.-]+)\s*(?::.*)?$/);
+                if (match) keys.add(match[1]);
+            }
+        }
+    }
+    return JSON.stringify([...keys]);
+}
+
 function applyCacheControlToContent(content, ttl) {
     const cacheControl = { type: 'ephemeral', ttl };
 
@@ -733,24 +950,47 @@ function applyCacheControlToContent(content, ttl) {
     return { content: parts, updatedExisting };
 }
 
-function applyClaudeOneHourCache(body) {
+function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
     if (!settings().claudeOneHourCache || !isClaudeCustomRequest(body)) return null;
 
-    let breakpointIndex = -1;
+    const native = buildNativeClaudeRequest(body);
+    const nativeUrl = buildNativeClaudeTunnelUrl(body.custom_url);
+    if (nativeTransportEligible && native && nativeUrl) {
+        const originalCustomUrl = body.custom_url;
+        body.custom_url = nativeUrl;
+        body.custom_include_body = JSON.stringify(native.request);
+        body.custom_exclude_body = mergeExcludedBodyKeys(body.custom_exclude_body, NATIVE_CLAUDE_EXCLUDED_BODY_KEYS);
+        body.tools = native.request.tools || [];
+        body.tool_choice = native.request.tool_choice;
+        body.custom_include_headers = appendYamlHeaderTokens(body.custom_include_headers, 'anthropic-beta', CLAUDE_CACHE_BETA_HEADERS);
+        body.custom_include_headers = appendYamlLine(body.custom_include_headers, 'anthropic-version', '2023-06-01');
+        body.custom_include_headers = appendYamlLine(body.custom_include_headers, 'x-app', 'cli');
+        return {
+            requestedTtl: CLAUDE_ONE_HOUR_CACHE_TTL,
+            transport: 'anthropic-native',
+            originalCustomUrl,
+            nativeEndpoint: nativeUrl,
+            cacheBreakpointCount: native.cacheBreakpointCount,
+            betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
+        };
+    }
+
+    const breakpointIndices = [];
     for (let i = 0; i < body.messages.length; i++) {
         if (body.messages[i]?.role !== 'system') break;
-        breakpointIndex = i;
+        breakpointIndices.push(i);
     }
-    if (breakpointIndex === -1) return null;
+    if (!breakpointIndices.length) return null;
+    const targets = breakpointIndices.slice(-2);
 
     let updatedExisting = 0;
-    for (let i = 0; i <= breakpointIndex; i++) {
+    for (let i = 0; i <= breakpointIndices[breakpointIndices.length - 1]; i++) {
         const message = body.messages[i];
         if (message?.cache_control) {
             message.cache_control = { ...message.cache_control, type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
             updatedExisting++;
         }
-        if (i === breakpointIndex) continue;
+        if (targets.includes(i)) continue;
         if (!Array.isArray(message?.content)) continue;
         message.content = message.content.map(part => {
             if (!part?.cache_control) return part;
@@ -762,11 +1002,15 @@ function applyClaudeOneHourCache(body) {
         });
     }
 
-    const breakpoint = body.messages[breakpointIndex];
-    const marked = applyCacheControlToContent(breakpoint.content, CLAUDE_ONE_HOUR_CACHE_TTL);
-    if (!marked) return null;
-    breakpoint.content = marked.content;
-    updatedExisting += marked.updatedExisting;
+    let markedBreakpoints = 0;
+    for (const index of targets) {
+        const marked = applyCacheControlToContent(body.messages[index].content, CLAUDE_ONE_HOUR_CACHE_TTL);
+        if (!marked) continue;
+        body.messages[index].content = marked.content;
+        updatedExisting += marked.updatedExisting;
+        markedBreakpoints++;
+    }
+    if (!markedBreakpoints) return null;
 
     body.custom_include_headers = appendYamlHeaderTokens(
         body.custom_include_headers,
@@ -776,8 +1020,9 @@ function applyClaudeOneHourCache(body) {
 
     return {
         requestedTtl: CLAUDE_ONE_HOUR_CACHE_TTL,
-        breakpointIndex,
-        breakpointRole: breakpoint.role,
+        transport: 'openai-compatible-fallback',
+        breakpointIndices: targets,
+        cacheBreakpointCount: markedBreakpoints,
         updatedExistingCacheControls: updatedExisting,
         betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
     };
@@ -785,12 +1030,13 @@ function applyClaudeOneHourCache(body) {
 
 function applyOptimization(body) {
     const s = settings();
+    const nativeTransportEligible = canUseNativeClaudeTransport(body);
     let promptOptimization;
     if (s.mode === 'stable_prefix_cache') promptOptimization = stablePrefixCacheFix(body);
     else if (s.mode === 'respect_choice_cache') promptOptimization = optimizeAfterSelection(body);
     else promptOptimization = legacyRewritePostProcessing(body);
 
-    const claudeOneHourCache = applyClaudeOneHourCache(body);
+    const claudeOneHourCache = applyClaudeOneHourCache(body, nativeTransportEligible);
     if (!promptOptimization && !claudeOneHourCache) return null;
     return { promptOptimization, claudeOneHourCache };
 }
@@ -818,12 +1064,243 @@ function summarizeMessages(messages) {
     };
 }
 
+function claudeStopReasonToOpenAI(reason) {
+    if (reason === 'max_tokens') return 'length';
+    if (reason === 'tool_use') return 'tool_calls';
+    if (reason === 'end_turn' || reason === 'stop_sequence') return 'stop';
+    return reason || null;
+}
+
+function claudeUsageToOpenAI(usage = {}) {
+    const cacheCreation = Number(usage.cache_creation_input_tokens || 0);
+    const cacheRead = Number(usage.cache_read_input_tokens || 0);
+    const input = Number(usage.input_tokens || 0);
+    const output = Number(usage.output_tokens || 0);
+    const cache5m = Number(usage.cache_creation?.ephemeral_5m_input_tokens || usage.cache_creation_5m_input_tokens || 0);
+    const cache1h = Number(usage.cache_creation?.ephemeral_1h_input_tokens || usage.cache_creation_1h_input_tokens || 0);
+    const promptTokens = input + cacheCreation + cacheRead;
+    return {
+        prompt_tokens: promptTokens,
+        completion_tokens: output,
+        total_tokens: promptTokens + output,
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_input_tokens: cacheCreation,
+        cache_read_input_tokens: cacheRead,
+        claude_cache_creation_5_m_tokens: cache5m,
+        claude_cache_creation_1_h_tokens: cache1h,
+        prompt_tokens_details: {
+            cached_tokens: cacheRead,
+            cached_creation_tokens: cacheCreation,
+        },
+        billing_usage: {
+            source: 'claude_messages',
+            semantic: 'anthropic',
+            claude_usage: usage,
+        },
+    };
+}
+
+function convertNativeClaudeJson(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data?.choices) || data.error) return data;
+    const blocks = Array.isArray(data.content) ? data.content : [];
+    const text = blocks.filter(block => block?.type === 'text').map(block => String(block.text || '')).join('');
+    const reasoning = blocks.filter(block => block?.type === 'thinking').map(block => String(block.thinking || '')).join('');
+    const toolCalls = blocks.filter(block => block?.type === 'tool_use').map(block => ({
+        id: String(block.id || ''),
+        type: 'function',
+        function: {
+            name: String(block.name || ''),
+            arguments: JSON.stringify(block.input || {}),
+        },
+    }));
+    const message = { role: 'assistant', content: text || null };
+    if (reasoning) message.reasoning_content = reasoning;
+    if (toolCalls.length) message.tool_calls = toolCalls;
+    return {
+        id: data.id,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: data.model,
+        choices: [{
+            index: 0,
+            message,
+            finish_reason: claudeStopReasonToOpenAI(data.stop_reason),
+        }],
+        usage: claudeUsageToOpenAI(data.usage),
+    };
+}
+
+function createOpenAIStreamChunk(state, delta = {}, finishReason = null, usage = undefined) {
+    const chunk = {
+        id: state.id || 'stch-claude-stream',
+        object: 'chat.completion.chunk',
+        created: state.created,
+        model: state.model || '',
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+    };
+    if (usage) chunk.usage = claudeUsageToOpenAI(usage);
+    return chunk;
+}
+
+function convertNativeClaudeStreamEvent(event, state) {
+    if (!event || typeof event !== 'object') return [];
+    if (Array.isArray(event.choices) || event.error) return [event];
+
+    if (event.type === 'message_start') {
+        state.id = event.message?.id || state.id;
+        state.model = event.message?.model || state.model;
+        state.usage = { ...(event.message?.usage || {}) };
+        return [createOpenAIStreamChunk(state, { role: 'assistant' }, null, state.usage)];
+    }
+    if (event.type === 'content_block_start') {
+        const block = event.content_block || {};
+        if (block.type === 'text' && block.text) return [createOpenAIStreamChunk(state, { content: block.text })];
+        if (block.type === 'thinking' && block.thinking) return [createOpenAIStreamChunk(state, { reasoning_content: block.thinking })];
+        if (block.type === 'tool_use') {
+            const toolIndex = state.nextToolIndex++;
+            state.toolIndices.set(event.index, toolIndex);
+            return [createOpenAIStreamChunk(state, {
+                tool_calls: [{
+                    index: toolIndex,
+                    id: String(block.id || ''),
+                    type: 'function',
+                    function: { name: String(block.name || ''), arguments: '' },
+                }],
+            })];
+        }
+        return [];
+    }
+    if (event.type === 'content_block_delta') {
+        const delta = event.delta || {};
+        if (delta.type === 'text_delta') return [createOpenAIStreamChunk(state, { content: String(delta.text || '') })];
+        if (delta.type === 'thinking_delta') return [createOpenAIStreamChunk(state, { reasoning_content: String(delta.thinking || '') })];
+        if (delta.type === 'input_json_delta') {
+            const toolIndex = state.toolIndices.get(event.index) ?? 0;
+            return [createOpenAIStreamChunk(state, {
+                tool_calls: [{ index: toolIndex, function: { arguments: String(delta.partial_json || '') } }],
+            })];
+        }
+        if (delta.type === 'signature_delta') {
+            return [createOpenAIStreamChunk(state, {
+                reasoning_details: [{ type: 'reasoning.encrypted', data: String(delta.signature || '') }],
+            })];
+        }
+        return [];
+    }
+    if (event.type === 'message_delta') {
+        state.usage = { ...state.usage, ...(event.usage || {}) };
+        return [createOpenAIStreamChunk(state, {}, claudeStopReasonToOpenAI(event.delta?.stop_reason), state.usage)];
+    }
+    if (event.type === 'message_stop') return ['[DONE]'];
+    return [];
+}
+
+function convertNativeClaudeSseResponse(response) {
+    if (!response.body) return response;
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const state = {
+        id: '',
+        model: '',
+        created: Math.floor(Date.now() / 1000),
+        usage: {},
+        toolIndices: new Map(),
+        nextToolIndex: 0,
+        sentDone: false,
+    };
+    let buffer = '';
+
+    const stream = response.body.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+            buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, '\n');
+            let boundary;
+            while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+                const frame = buffer.slice(0, boundary);
+                buffer = buffer.slice(boundary + 2);
+                emitFrame(frame, controller);
+            }
+        },
+        flush(controller) {
+            buffer += decoder.decode();
+            if (buffer.trim()) emitFrame(buffer, controller);
+            if (!state.sentDone) controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        },
+    }));
+
+    function emitFrame(frame, controller) {
+        const data = frame.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+            .join('\n');
+        if (!data) return;
+        if (data === '[DONE]') {
+            state.sentDone = true;
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            return;
+        }
+        let event;
+        try {
+            event = JSON.parse(data);
+        } catch {
+            return;
+        }
+        for (const converted of convertNativeClaudeStreamEvent(event, state)) {
+            if (converted === '[DONE]') {
+                if (!state.sentDone) controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                state.sentDone = true;
+            } else {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(converted)}\n\n`));
+            }
+        }
+    }
+
+    const headers = new Headers(response.headers);
+    headers.set('content-type', 'text/event-stream; charset=utf-8');
+    headers.delete('content-length');
+    return new Response(stream, { status: response.status, statusText: response.statusText, headers });
+}
+
+async function convertNativeClaudeResponse(response, streamRequested) {
+    if (!response.ok) return response;
+    const contentType = String(response.headers.get('content-type') || '');
+    if (streamRequested && contentType.includes('application/json')) {
+        try {
+            const data = await response.clone().json();
+            const converted = convertNativeClaudeJson(data);
+            const headers = new Headers(response.headers);
+            headers.delete('content-length');
+            headers.set('content-type', 'text/event-stream; charset=utf-8');
+            const payload = `data: ${JSON.stringify(converted)}\n\ndata: [DONE]\n\n`;
+            return new Response(payload, { status: response.status, statusText: response.statusText, headers });
+        } catch {
+            return response;
+        }
+    }
+    // SillyTavern's streaming proxy does not consistently preserve the
+    // upstream content-type, so the original request flag is authoritative.
+    if (streamRequested) return convertNativeClaudeSseResponse(response);
+
+    let data;
+    try {
+        data = await response.clone().json();
+    } catch {
+        return response;
+    }
+    const converted = convertNativeClaudeJson(data);
+    const headers = new Headers(response.headers);
+    headers.delete('content-length');
+    headers.set('content-type', 'application/json; charset=utf-8');
+    return new Response(JSON.stringify(converted), { status: response.status, statusText: response.statusText, headers });
+}
+
 function installFetchPatch() {
     if (window.__stCacheHelperFetchPatched) return;
     window.__stCacheHelperFetchPatched = true;
 
     const originalFetch = window.fetch.bind(window);
     window.fetch = async function patchedFetch(input, init = {}) {
+        let nativeClaudeTransport = null;
         try {
             const url = typeof input === 'string' ? input : input?.url;
             const isGenerate = typeof url === 'string' && url.includes('/api/backends/chat-completions/generate');
@@ -832,6 +1309,9 @@ function installFetchPatch() {
                 if (shouldTouchBody(body)) {
                     const changed = applyOptimization(body);
                     if (changed) {
+                        if (changed.claudeOneHourCache?.transport === 'anthropic-native') {
+                            nativeClaudeTransport = { streamRequested: !!body.stream };
+                        }
                         init = { ...init, body: JSON.stringify(body) };
                         if (settings().log) console.info('[ST Cache Helper] optimized request', changed);
                     } else if (settings().log) {
@@ -842,7 +1322,15 @@ function installFetchPatch() {
         } catch (err) {
             console.warn('[ST Cache Helper] fetch patch error', err);
         }
-        return originalFetch(input, init);
+        const response = await originalFetch(input, init);
+        if (nativeClaudeTransport) {
+            try {
+                return await convertNativeClaudeResponse(response, nativeClaudeTransport.streamRequested);
+            } catch (err) {
+                console.warn('[ST Cache Helper] native Claude response conversion error', err);
+            }
+        }
+        return response;
     };
 }
 
@@ -876,8 +1364,8 @@ function addPanel() {
       <label class="stch-row"><input id="stch_dedupe_prefix" type="checkbox"> 去重稳定前缀里的重复 system 块</label>
       <label class="stch-row"><input id="stch_canonicalize_prefix" type="checkbox"> 规范化稳定前缀换行/尾随空格</label>
       <label class="stch-row"><input id="stch_remember_depth_order" type="checkbox"> 记忆稳定世界书顺序，新条目尽量追加到后面</label>
-      <label class="stch-row"><input id="stch_claude_1h_cache" type="checkbox"> 请求 Claude 1 小时缓存（ttl=1h）</label>
-      <div class="stch-muted">1 小时缓存仅对自定义 OpenAI 中模型名含 Claude 的请求生效；插件会在稳定 system 前缀末尾写入标准 Anthropic 缓存断点。是否实际写入由上游代理决定。</div>
+      <label class="stch-row"><input id="stch_claude_1h_cache" type="checkbox"> Claude 原生 1 小时缓存（Claude Code 方式）</label>
+      <div class="stch-muted">仅处理自定义 OpenAI 中模型名含 Claude 的请求。启用后通过同一地址的 <code>/v1/messages</code> 原生协议发送，在稳定 system 前缀放置两个 <code>ttl=1h</code> 断点，并自动转换普通/流式响应。</div>
       <div class="stch-muted">世界书说明：只提升像长期设定/资料库的块；含“当前状态/本轮/最新”等动态状态栏会尽量留在原位，避免反而破坏缓存或剧情。</div>
       <div class="stch-muted">注意：这是前端请求级修复，不修改 ST 后端源码和 NewAPI。稳定前缀模式会清空 post-processing，原因是它已经把静态提示块固定到前缀，不能再让 ST 后端二次移动这些块。</div>
     </div>`;
