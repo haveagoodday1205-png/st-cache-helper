@@ -3,6 +3,8 @@ import { saveSettingsDebounced, substituteParams } from '../../../../script.js';
 import { getChatCompletionPreset } from '../../../openai.js';
 
 const MODULE = 'st_cache_helper';
+const STABLE_DEPTH_ORDER_KEY = 'st_cache_helper_stable_depth_order_v1';
+let stableDepthOrderMemory = {};
 const DEFAULTS = Object.freeze({
     enabled: true,
     // Respect the UI choice, emulate the selected post-processing locally,
@@ -12,6 +14,18 @@ const DEFAULTS = Object.freeze({
     onlyCustomOpenAI: true,
     stampRequests: true,
     recoverStrandedSystemPrompts: true,
+    // Conservatively lift stable World Info / Lorebook / Memory blocks that ST
+    // or presets inject as user/assistant messages at depth. Dynamic/current-state
+    // blocks stay near the live chat.
+    promoteStableDepthPrompts: true,
+    depthPromoteMinChars: 260,
+    // If ST emits a depth/world-info block as a mid-chat system message and the
+    // block looks dynamic/current-state, keep it near the live conversation
+    // instead of hoisting it into the cache prefix.
+    keepVolatileDepthSystemNearChat: true,
+    dedupeStablePrefixPrompts: true,
+    canonicalizeStablePrefix: true,
+    rememberStableDepthOrder: true,
 });
 
 const POST_TYPES = new Set(['strict', 'strict_tools', 'semi', 'semi_tools', 'merge', 'merge_tools', 'single', 'claude']);
@@ -98,6 +112,40 @@ function cloneMessage(m) {
         ...m,
         content: contentToText(m?.content),
     };
+}
+
+function normalizePrefixText(text) {
+    text = String(text ?? '');
+    if (!settings().canonicalizeStablePrefix) return text;
+    return text
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\t ]+\n/g, '\n')
+        .replace(/\n{4,}/g, '\n\n\n')
+        .trim();
+}
+
+function stablePromptHash(message) {
+    return hashText(normalizePrefixText(contentToText(message?.content)).trim());
+}
+
+function loadStableDepthOrder() {
+    try {
+        if (typeof localStorage !== 'undefined') {
+            const raw = localStorage.getItem(STABLE_DEPTH_ORDER_KEY);
+            const parsed = raw ? JSON.parse(raw) : {};
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        }
+    } catch { /* noop */ }
+    return { ...stableDepthOrderMemory };
+}
+
+function saveStableDepthOrder(order) {
+    stableDepthOrderMemory = { ...order };
+    try {
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(STABLE_DEPTH_ORDER_KEY, JSON.stringify(order));
+        }
+    } catch { /* noop */ }
 }
 
 function activePromptOrder(promptSettings) {
@@ -195,6 +243,94 @@ function isPresetPromptMessage(message, promptDefs) {
     return promptDefs.some(p => p.hash === hash && p.role === message.role);
 }
 
+const STABLE_DEPTH_MARKER_RE = /(?:World\s*Info|Lorebook|世界书|世界信息|世界设定|角色设定|人物设定|地点设定|背景设定|长期记忆|常驻记忆|Memory|Author'?s\s*Note|vectorsDataBank|vectorsMemory|smartContext|Data\s*Bank|<\s*(?:world|lore|memory|setting|character)[\s>]|\[(?:World\s*Info|Lorebook|Memory|设定|世界书)\])/i;
+const STATIC_LORE_STYLE_RE = /(?:^|\n)\s*(?:Name|名称|角色|人物|地点|Location|Background|背景|Personality|性格|Appearance|外貌|Scenario|场景|规则|Rule|Setting|设定|Profile|档案|Summary|摘要)\s*[:：]/i;
+const VOLATILE_DEPTH_RE = /(?:当前状态|即时状态|本轮|上一轮|最新|刚才|目前|现在时间|当前时间|今天日期|last\s*(?:message|reply)|current\s*(?:message|scene|state|time)|recent\s*(?:chat|events)|动态|临时|scratchpad|任务进度|剧情进度|status\s*bar)/i;
+const CHATLIKE_LINE_RE = /^\s*(?:User|Assistant|{{user}}|{{char}}|你|我|他说|她说|[\w\u4e00-\u9fa5]{1,24})\s*[:：]/m;
+
+function lastUserMessageIndex(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.role === 'user') return i;
+    }
+    return -1;
+}
+
+function firstNonSystemMessageIndex(messages) {
+    const index = messages.findIndex(m => m?.role !== 'system');
+    return index === -1 ? messages.length : index;
+}
+
+function hasPermanentDepthMarker(text) {
+    return /(?:长期记忆|常驻记忆|永久|固定|stable|permanent|角色设定|人物设定|地点设定|世界设定)/i.test(text);
+}
+
+function isVolatileDepthText(text) {
+    text = String(text ?? '');
+    if (!VOLATILE_DEPTH_RE.test(text)) return false;
+    // A block explicitly marked permanent can still mention "current" in its own
+    // rules; do not treat that as sliding state.
+    if (hasPermanentDepthMarker(text)) return false;
+    return true;
+}
+
+function isMidChatVolatileSystemPrompt(message, index, messages) {
+    if (message?.role !== 'system') return false;
+    if (index < firstNonSystemMessageIndex(messages)) return false;
+    const text = contentToText(message.content).trim();
+    if (!text) return false;
+    return isVolatileDepthText(text);
+}
+
+function asUserContextPrompt(message) {
+    const out = cloneMessage(message);
+    out._stchOriginalRole = out.role;
+    out.role = 'user';
+    delete out.name;
+    delete out.tool_calls;
+    delete out.tool_call_id;
+    return out;
+}
+
+function isProbablyConversationTurn(message, body) {
+    const text = contentToText(message?.content).trim();
+    if (!text) return true;
+    const names = [body?.char_name, body?.user_name, ...(Array.isArray(body?.group_names) ? body.group_names : [])]
+        .filter(Boolean).map(String).filter(x => x.length <= 40);
+    if (names.some(name => text.startsWith(`${name}:`) || text.startsWith(`${name}：`))) return true;
+    // Short dialogue-like user/assistant messages are very likely real chat turns.
+    if (text.length < 220 && (/[“”"「」]/.test(text) || /[。！？!?]$/.test(text))) return true;
+    return false;
+}
+
+function isStableDepthPromptMessage(message, body, index, messages) {
+    const s = settings();
+    if (!s.promoteStableDepthPrompts) return false;
+    if (!['system', 'user', 'assistant'].includes(message?.role)) return false;
+    if (message?._stchRecovered) return false;
+
+    const text = contentToText(message.content).trim();
+    if (text.length < Math.max(80, Number(s.depthPromoteMinChars || 260))) return false;
+
+    // Never move the latest live user turn, nor the final assistant turn. Depth
+    // inserts usually sit above recent history, while the live message is tail.
+    const lastUser = lastUserMessageIndex(messages);
+    if (index === lastUser || index >= messages.length - 1) return false;
+
+    const hasStrongMarker = STABLE_DEPTH_MARKER_RE.test(text);
+    const hasLoreShape = text.length >= 700 && STATIC_LORE_STYLE_RE.test(text);
+    if (!hasStrongMarker && !hasLoreShape) return false;
+
+    // Dynamic state / current-scene summaries are intentionally not lifted; if
+    // their content changes every turn and is placed at the very front, cache read
+    // becomes worse, not better.
+    if (isVolatileDepthText(text)) return false;
+
+    if (isProbablyConversationTurn(message, body) && !hasStrongMarker) return false;
+    if (CHATLIKE_LINE_RE.test(text) && !hasStrongMarker && text.length < 1200) return false;
+
+    return true;
+}
+
 function startsWithGroupName(text, groupNames = []) {
     return groupNames.some(name => String(text).startsWith(`${name}: `));
 }
@@ -287,11 +423,96 @@ function isStaticAssistantPrompt(message) {
 
 function asSystemPrompt(message) {
     const out = cloneMessage(message);
+    out._stchOriginalRole = out.role;
     out.role = 'system';
+    out.content = normalizePrefixText(out.content);
     delete out.name;
     delete out.tool_calls;
     delete out.tool_call_id;
     return out;
+}
+
+function stripInternalFields(message) {
+    delete message._stchOriginalRole;
+    delete message._stchRecovered;
+    delete message._stchReason;
+    delete message._stchPromptIndex;
+    delete message._stchDepthHash;
+    delete message._stchDepthOrder;
+    return message;
+}
+
+function dedupePrefixPrompts(messages) {
+    if (!settings().dedupeStablePrefixPrompts) return { messages, removed: 0 };
+    const seen = new Set();
+    const out = [];
+    let removed = 0;
+
+    for (const msg of messages) {
+        const key = `${msg.role}:${hashText(contentToText(msg.content).trim())}`;
+        if (msg.role === 'system' && seen.has(key)) {
+            removed++;
+            continue;
+        }
+        if (msg.role === 'system') seen.add(key);
+        out.push(msg);
+    }
+
+    return { messages: out, removed };
+}
+
+function orderStableDepthPrompts(prompts) {
+    const stable = [];
+    const other = [];
+
+    for (let i = 0; i < prompts.length; i++) {
+        const msg = prompts[i];
+        msg._stchPromptIndex = i;
+        if (String(msg._stchReason || '').startsWith('stable-depth')) stable.push(msg);
+        else other.push(msg);
+    }
+
+    if (!settings().rememberStableDepthOrder || !stable.length) {
+        return { prompts, knownStableDepthBlocks: 0, newStableDepthBlocks: 0 };
+    }
+
+    const order = loadStableDepthOrder();
+    let max = -1;
+    for (const value of Object.values(order)) {
+        const n = Number(value);
+        if (Number.isFinite(n) && n > max) max = n;
+    }
+
+    let changed = false;
+    let known = 0;
+    let created = 0;
+    for (const msg of stable) {
+        const h = stablePromptHash(msg);
+        msg._stchDepthHash = h;
+        if (Number.isFinite(Number(order[h]))) {
+            known++;
+        } else {
+            order[h] = ++max;
+            changed = true;
+            created++;
+        }
+        msg._stchDepthOrder = Number(order[h]);
+    }
+
+    if (changed) saveStableDepthOrder(order);
+
+    stable.sort((a, b) => {
+        const da = Number(a._stchDepthOrder ?? 0);
+        const db = Number(b._stchDepthOrder ?? 0);
+        if (da !== db) return da - db;
+        return Number(a._stchPromptIndex ?? 0) - Number(b._stchPromptIndex ?? 0);
+    });
+
+    // Keep base/preset/system prompts first; put stable depth/lore blocks after
+    // that base in remembered append-only order. If a new world entry activates,
+    // it tends to append after known entries instead of being inserted before them
+    // and invalidating the whole prefix.
+    return { prompts: [...other, ...stable], knownStableDepthBlocks: known, newStableDepthBlocks: created };
 }
 
 function stablePrefixCacheFix(body) {
@@ -301,15 +522,35 @@ function stablePrefixCacheFix(body) {
     const recovered = recoverMissingSystemPromptMessages(body, promptDefs);
     const prompts = [];
     const conversation = [];
+    let volatileSystemDepthKept = 0;
 
-    for (const raw of body.messages) {
+    for (let i = 0; i < body.messages.length; i++) {
+        const raw = body.messages[i];
         const msg = cloneMessage(raw);
         if (msg.role === 'system') {
-            prompts.push(asSystemPrompt(msg));
+            if (settings().keepVolatileDepthSystemNearChat && isMidChatVolatileSystemPrompt(msg, i, body.messages)) {
+                const kept = asUserContextPrompt(msg);
+                kept._stchReason = 'volatile-system-depth-kept';
+                conversation.push(kept);
+                volatileSystemDepthKept++;
+            } else {
+                const promoted = asSystemPrompt(msg);
+                const isDepthSystem = i >= firstNonSystemMessageIndex(body.messages);
+                promoted._stchReason = isDepthSystem && isStableDepthPromptMessage(msg, body, i, body.messages) ? 'stable-depth-system-prompt' : 'system';
+                prompts.push(promoted);
+            }
         } else if (isStaticAssistantPrompt(msg)) {
-            prompts.push(asSystemPrompt(msg));
+            const promoted = asSystemPrompt(msg);
+            promoted._stchReason = 'static-assistant-prompt';
+            prompts.push(promoted);
         } else if (isPresetPromptMessage(msg, promptDefs)) {
-            prompts.push(asSystemPrompt(msg));
+            const promoted = asSystemPrompt(msg);
+            promoted._stchReason = 'preset-prompt';
+            prompts.push(promoted);
+        } else if (isStableDepthPromptMessage(msg, body, i, body.messages)) {
+            const promoted = asSystemPrompt(msg);
+            promoted._stchReason = 'stable-depth-prompt';
+            prompts.push(promoted);
         } else {
             conversation.push(msg);
         }
@@ -317,7 +558,11 @@ function stablePrefixCacheFix(body) {
 
     if (!prompts.length && !recovered.length) return null;
 
-    body.messages = [...recovered.map(asSystemPrompt), ...prompts, ...conversation];
+    const ordered = orderStableDepthPrompts(prompts);
+    const promotedStableDepthBlocks = ordered.prompts.filter(x => String(x._stchReason || '').startsWith('stable-depth')).length;
+    const prefix = [...recovered.map(asSystemPrompt), ...ordered.prompts];
+    const deduped = dedupePrefixPrompts(prefix);
+    body.messages = [...deduped.messages, ...conversation].map(stripInternalFields);
 
     // This mode deliberately bypasses ST backend prompt post-processing.
     // We are preserving the content, but moving static prompt blocks into a stable
@@ -325,7 +570,7 @@ function stablePrefixCacheFix(body) {
     body.custom_prompt_post_processing = '';
 
     if (settings().stampRequests) {
-        body.custom_include_headers = appendYamlLine(body.custom_include_headers, 'X-ST-Cache-Helper', 'stable-prefix-cache-v1');
+        body.custom_include_headers = appendYamlLine(body.custom_include_headers, 'X-ST-Cache-Helper', 'stable-prefix-cache-v4');
     }
 
     return {
@@ -334,6 +579,12 @@ function stablePrefixCacheFix(body) {
         sentPostProcessing: 'none-stable-prefix',
         recoveredStrandedSystemBlocks: recovered.length,
         promotedSystemBlocks: prompts.length + recovered.length,
+        promotedStableDepthBlocks,
+        volatileSystemDepthKept,
+        dedupedStablePrefixBlocks: deduped.removed,
+        knownStableDepthBlocks: ordered.knownStableDepthBlocks,
+        newStableDepthBlocks: ordered.newStableDepthBlocks,
+        canonicalizeStablePrefix: !!settings().canonicalizeStablePrefix,
         conversationBlocks: conversation.length,
         before: originalSummary,
         after: summarizeMessages(body.messages),
@@ -498,6 +749,12 @@ function addPanel() {
       <label class="stch-row"><input id="stch_log" type="checkbox"> 控制台输出调试日志</label>
       <label class="stch-row"><input id="stch_stamp" type="checkbox"> 给请求加调试头 <code>X-ST-Cache-Helper</code></label>
       <label class="stch-row"><input id="stch_recover_stranded" type="checkbox"> 自动识别并补回“显示在预设里但没进请求体”的自定义 system 提示词</label>
+      <label class="stch-row"><input id="stch_promote_depth" type="checkbox"> 保守提升稳定世界书/深度注入块到缓存前缀</label>
+      <label class="stch-row"><input id="stch_keep_volatile_system" type="checkbox"> 中段动态 system 不提前，留在聊天附近</label>
+      <label class="stch-row"><input id="stch_dedupe_prefix" type="checkbox"> 去重稳定前缀里的重复 system 块</label>
+      <label class="stch-row"><input id="stch_canonicalize_prefix" type="checkbox"> 规范化稳定前缀换行/尾随空格</label>
+      <label class="stch-row"><input id="stch_remember_depth_order" type="checkbox"> 记忆稳定世界书顺序，新条目尽量追加到后面</label>
+      <div class="stch-muted">世界书说明：只提升像长期设定/资料库的块；含“当前状态/本轮/最新”等动态状态栏会尽量留在原位，避免反而破坏缓存或剧情。</div>
       <div class="stch-muted">注意：这是前端请求级修复，不修改 ST 后端源码和 NewAPI。稳定前缀模式会清空 post-processing，原因是它已经把静态提示块固定到前缀，不能再让 ST 后端二次移动这些块。</div>
     </div>`;
 
@@ -529,6 +786,26 @@ function addPanel() {
         settings().recoverStrandedSystemPrompts = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
+    $('#stch_promote_depth').prop('checked', !!s.promoteStableDepthPrompts).on('change', function () {
+        settings().promoteStableDepthPrompts = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#stch_keep_volatile_system').prop('checked', !!s.keepVolatileDepthSystemNearChat).on('change', function () {
+        settings().keepVolatileDepthSystemNearChat = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#stch_dedupe_prefix').prop('checked', !!s.dedupeStablePrefixPrompts).on('change', function () {
+        settings().dedupeStablePrefixPrompts = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#stch_canonicalize_prefix').prop('checked', !!s.canonicalizeStablePrefix).on('change', function () {
+        settings().canonicalizeStablePrefix = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#stch_remember_depth_order').prop('checked', !!s.rememberStableDepthOrder).on('change', function () {
+        settings().rememberStableDepthOrder = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
 }
 
 function exposeDebug() {
@@ -538,6 +815,10 @@ function exposeDebug() {
             const clone = structuredClone(body);
             const changed = shouldTouchBody(clone) ? applyOptimization(clone) : null;
             return { changed, body: clone };
+        },
+        clearStableDepthOrder() {
+            stableDepthOrderMemory = {};
+            try { if (typeof localStorage !== 'undefined') localStorage.removeItem(STABLE_DEPTH_ORDER_KEY); } catch { /* noop */ }
         },
     };
 }

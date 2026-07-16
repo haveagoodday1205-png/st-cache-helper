@@ -24,7 +24,7 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 - 把 ST 中后段静态提示词提前为稳定前缀，避免随聊天轮次滑动；
 - 自动识别并补回“预设里显示存在、但实际没进请求体”的自定义 `system_prompt: true` 提示词；
 - 避免 Strict 后处理重新移动提示词；
-- 给请求加可选调试头：`X-ST-Cache-Helper: stable-prefix-cache-v1`。
+- 给请求加可选调试头：`X-ST-Cache-Helper: stable-prefix-cache-v4`。
 
 ## 为什么需要它
 
@@ -98,3 +98,25 @@ cache_creation_tokens 很低
 - 不修改 NewAPI。
 - 不修改 SillyTavern 后端源码。
 - 不能保证所有动态预设 100% 命中缓存；如果预设每轮把时间、随机数、summary、动态世界书放到前缀，仍可能降低缓存命中。
+
+
+## 0.6.0
+
+- 新增“保守提升稳定世界书/深度注入块”：把明显是长期设定、Lorebook、Memory、World Info 的中段 user/assistant 注入块提升到 system 缓存前缀。
+- 动态状态栏/本轮/最新/当前状态类内容默认不提升，避免破坏剧情与缓存前缀。
+
+## 0.7.0
+
+- 新增“中段动态 system 不提前”：如果世界书/深度注入以 system 角色出现在聊天中段，且内容像“当前状态/本轮/上一轮/最新”等动态状态栏，会转成普通上下文留在原位置，不再被强制提升到缓存前缀。
+- 新增稳定前缀 system 去重：同一请求里重复出现的 system 块只保留第一份，减少无意义 token 并提高前缀稳定性。
+- 调试头升级为 `X-ST-Cache-Helper: stable-prefix-cache-v4`。
+
+## 0.8.0
+
+- 新增稳定前缀规范化：对提升到缓存前缀的 system/preset/lore 文本统一 CRLF/LF、尾随空格和过多空行，减少同一提示词因换行差异导致的缓存断点。
+- 新增稳定世界书顺序记忆：稳定 depth/lore 块按首次出现顺序记忆；后续新增世界书尽量追加到已知世界书后面，避免新条目插到前面导致整段前缀失效。
+- 调试头升级为 `X-ST-Cache-Helper: stable-prefix-cache-v4`。
+
+## 0.8.1
+
+- 修正稳定世界书顺序记忆范围：开头主预设/角色卡 system 不再参与 depth/lore 顺序记忆，避免长期跨角色排序影响角色卡原始顺序；只有聊天中段/深度插入的稳定 system 和 user/assistant lore 会参与。
