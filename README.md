@@ -150,3 +150,9 @@ cache_creation.ephemeral_1h_input_tokens > 0
 
 - 补齐 Claude Code 的消息级缓存断点：除两个稳定 system 断点外，最后一条 user 内容也会标记 `ttl=1h`。
 - 修复部分 Claude Haiku / Claude Code 专用网关忽略仅有 system 断点、导致完全不写缓存的问题。
+
+## 0.10.2
+
+- 新增默认开启的“Opus 1h Claude Code 兼容前缀”：部分 Claude Code 专用运营商只有识别到两个标准 system 标记时才会让 Opus 接受 `ttl=1h`。
+- 兼容标记后立即加入同级中和说明，明确它们只用于传输兼容；后续 SillyTavern 角色卡、预设和世界书仍是权威人格与任务指令。
+- 该兼容仅作用于 `claude-opus-*`，Haiku 等已能正常写 1h 的模型不注入此前缀；设置面板可单独关闭。

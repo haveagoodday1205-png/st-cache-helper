@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Codex",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "homePage": "https://local/st-cache-helper",
   "hooks": {
     "activate": "init"
