@@ -211,3 +211,10 @@ epoch-reset  修订日志达到容量边界，本轮重新冷写
 - 全局日志按聊天、角色、模型和接口隔离；system 修订超过 8 次或累计约 600k 字符、conversation 修订超过 8 次或日志显著膨胀时自动开启新 epoch。
 - 使用此前 Request Monitor 导出的真实 4 轮请求回放：旧版每轮重复约 39k 动态上下文；新版首轮后第二轮只写真实变化的 1,128 字符，第三、第四轮重复动态写入均为 0，且每轮 wire 都完整保留上一轮前缀。
 - Haiku 4.5 真实网关验证：首轮 `ephemeral_1h_input_tokens=27,305`；第二轮读取 `27,305`、仅写 `14`；第三轮同时追加楼层并修改 system，仍读取 `27,319`、仅写 `85`。
+
+## 0.11.1
+
+- 修复空内容的预设分隔项被转换为 Anthropic `system: [{ type: "text", text: "" }]`，导致上游返回 `400 system: text content blocks must be non-empty` 的问题。
+- 原生 Claude 与 OpenAI-compatible 回退路径现在统一过滤字符串、数组和纯空白形式的空文本块，并为清理后为空的 user/assistant 消息加入安全占位内容。
+- system 与 conversation 增量日志在读取旧 `sessionStorage` 快照时也会清理无效块，防止升级后继续复用此前保存的空内容。
+- 最终 `/v1/messages` 请求发送前再次执行完整性清理并重新核算缓存断点，避免其他插件或旧日志重新引入非法文本块。

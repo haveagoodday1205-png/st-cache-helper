@@ -1,6 +1,12 @@
 import { extension_settings, getContext } from '../../../extensions.js';
 import { eventSource, event_types, saveSettingsDebounced, substituteParams } from '../../../../script.js';
 import { getChatCompletionPreset } from '../../../openai.js';
+import {
+    sanitizeClaudeSourceMessages,
+    sanitizeNativeContentBlocks,
+    sanitizeNativeMessages,
+    toNativeContentBlocks,
+} from './native-content.js';
 
 const MODULE = 'st_cache_helper';
 const CHAT_COMPLETIONS_GENERATE_PATH = '/api/backends/chat-completions/generate';
@@ -761,18 +767,6 @@ function isClaudeCustomRequest(body) {
     return body?.chat_completion_source === 'custom' && /(?:^|[/_-])claude(?:$|[/_.-])/i.test(String(body?.model || ''));
 }
 
-function toNativeContentBlocks(content) {
-    if (typeof content === 'string') return [{ type: 'text', text: content }];
-    if (!Array.isArray(content)) return [];
-
-    return content.map(part => {
-        if (!part || typeof part !== 'object') return { type: 'text', text: String(part ?? '') };
-        const out = { ...part };
-        delete out.cache_control;
-        return out;
-    }).filter(part => part.type !== 'text' || String(part.text || '').length > 0);
-}
-
 function splitNativeSystemBlock(block) {
     if (block?.type !== 'text' || typeof block.text !== 'string' || block.text.length < 2) return [block];
     const target = Math.floor(block.text.length / 2);
@@ -801,11 +795,7 @@ function isSelectiveNativeLoreBlock(block) {
 }
 
 function cloneNativeTextBlocks(blocks) {
-    return blocks.map(block => {
-        const clone = structuredClone(block);
-        delete clone.cache_control;
-        return clone;
-    });
+    return sanitizeNativeContentBlocks(blocks, { stripCacheControl: true });
 }
 
 function universalSystemJournalScope(body) {
@@ -850,6 +840,12 @@ function saveUniversalSystemJournalStore(store) {
 
 function systemBlockTexts(blocks) {
     return blocks.map(block => String(block?.text || ''));
+}
+
+function sanitizeStoredSystemTexts(texts) {
+    return (Array.isArray(texts) ? texts : [])
+        .map(text => String(text ?? ''))
+        .filter(text => text.trim().length > 0);
 }
 
 function sameStringArray(left, right) {
@@ -921,7 +917,7 @@ function addUniversalJournalProtocol(blocks) {
 function stabilizeUniversalSystemBlocks(blocks, body) {
     const current = cloneNativeTextBlocks(blocks);
     const currentTexts = systemBlockTexts(current);
-    const freshWire = current.length === 1 ? splitNativeSystemBlock(current[0]) : current;
+    const freshWire = cloneNativeTextBlocks(current.length === 1 ? splitNativeSystemBlock(current[0]) : current);
     if (!settings().universalIncrementalCache) {
         return {
             blocks: freshWire,
@@ -944,18 +940,19 @@ function stabilizeUniversalSystemBlocks(blocks, body) {
     let accumulatedJournalChars = 0;
     let deferredContextBlocks = [];
 
-    if (previous?.protocolVersion === 1 && Array.isArray(previous.logicalTexts) && Array.isArray(previous.wireBlocks)) {
-        const previousWire = cloneNativeTextBlocks(previous.wireBlocks);
+    const previousLogicalTexts = sanitizeStoredSystemTexts(previous?.logicalTexts);
+    const previousWire = cloneNativeTextBlocks(previous?.wireBlocks || []);
+    if (previous?.protocolVersion === 1 && previousLogicalTexts.length && previousWire.length) {
         revision = Number(previous.revision || 0);
         epochHash = String(previous.epochHash || epochHash);
         accumulatedJournalChars = Number(previous.accumulatedJournalChars || 0);
         appendedChars = 0;
         wire = previousWire;
-        if (sameStringArray(currentTexts, previous.logicalTexts)) {
+        if (sameStringArray(currentTexts, previousLogicalTexts)) {
             status = 'reused';
         } else {
             revision++;
-            const appended = appendedSystemBlocks(current, currentTexts, previous.logicalTexts);
+            const appended = appendedSystemBlocks(current, currentTexts, previousLogicalTexts);
             if (appended) {
                 const appendBlock = buildSystemAppendBlock(appended, revision);
                 deferredContextBlocks = [appendBlock];
@@ -1024,7 +1021,8 @@ function buildNativeSystem(messages, model, body) {
         }
     }
     const universalJournal = stabilizeUniversalSystemBlocks(blocks, body);
-    blocks = universalJournal.blocks;
+    blocks = sanitizeNativeContentBlocks(universalJournal.blocks);
+    if (!blocks.length) return null;
 
     const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
     let cacheBreakpointCount = Math.min(2, blocks.length);
@@ -1119,12 +1117,7 @@ function buildNativeMessages(messages, leadingSystemMessages, model) {
 }
 
 function cloneNativeContentWithoutCacheControl(content) {
-    return (Array.isArray(content) ? content : []).map(part => {
-        if (!part || typeof part !== 'object') return part;
-        const clone = structuredClone(part);
-        delete clone.cache_control;
-        return clone;
-    });
+    return sanitizeNativeContentBlocks(content, { stripCacheControl: true });
 }
 
 function nativeUserPersistentText(message) {
@@ -1218,12 +1211,7 @@ function nativeUserSnapshotScope(body, stableSystemHash) {
 }
 
 function cloneNativeConversationMessages(messages) {
-    return (Array.isArray(messages) ? messages : []).map(message => {
-        const clone = structuredClone(message);
-        delete clone.cache_control;
-        clone.content = cloneNativeContentWithoutCacheControl(clone.content);
-        return clone;
-    });
+    return sanitizeNativeMessages(messages, { stripCacheControl: true });
 }
 
 function extractNativeUserSideContext(messages) {
@@ -1988,7 +1976,7 @@ function buildNativeClaudeRequest(body) {
         universalDynamicBlocks,
         useUniversalJournal ? system.deferredContextBlocks : [],
     );
-    messages = conversationJournal.messages;
+    messages = sanitizeNativeMessages(conversationJournal.messages);
     if (useUniversalJournal) {
         Object.assign(snapshotInfo, {
             dynamicLoreBlockCount: conversationJournal.dynamicLoreBlockCount,
@@ -2000,6 +1988,10 @@ function buildNativeClaudeRequest(body) {
             incrementalWireReused: conversationJournal.incrementalWireReused,
         });
     }
+    const systemBlocks = sanitizeNativeContentBlocks(system.blocks);
+    const systemCacheBreakpointCount = systemBlocks.filter(block => block?.cache_control).length;
+    if (!systemBlocks.length || systemCacheBreakpointCount < 2) return null;
+
     // Claude Code also marks the newest user-side content block. Some Claude
     // gateways only activate extended-TTL caching when this message breakpoint
     // is present, even if the system blocks already carry ttl=1h.
@@ -2013,7 +2005,7 @@ function buildNativeClaudeRequest(body) {
         max_tokens: Math.max(1, Number(body.max_tokens || body.max_completion_tokens || 4096)),
         stream: !!body.stream,
         metadata: cacheMetadata.metadata,
-        system: system.blocks,
+        system: systemBlocks,
         messages,
     };
     if (Array.isArray(body.stop) && body.stop.length) request.stop_sequences = body.stop;
@@ -2024,8 +2016,8 @@ function buildNativeClaudeRequest(body) {
     }
     return {
         request,
-        cacheBreakpointCount: system.cacheBreakpointCount + messageCacheBreakpointCount,
-        systemCacheBreakpointCount: system.cacheBreakpointCount,
+        cacheBreakpointCount: systemCacheBreakpointCount + messageCacheBreakpointCount,
+        systemCacheBreakpointCount,
         messageCacheBreakpointCount,
         claudeCodeCompatPrefix: system.claudeCodeCompatPrefix,
         universalSystemJournal: system.universalSystemJournal,
@@ -2084,17 +2076,8 @@ function mergeExcludedBodyKeys(value, requiredKeys) {
 
 function applyCacheControlToContent(content, ttl) {
     const cacheControl = { type: 'ephemeral', ttl };
-
-    if (typeof content === 'string') {
-        return {
-            content: [{ type: 'text', text: content, cache_control: cacheControl }],
-            updatedExisting: 0,
-        };
-    }
-
-    if (!Array.isArray(content)) return null;
-
-    const parts = content.map(part => part && typeof part === 'object' ? { ...part } : part);
+    const source = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
+    const parts = sanitizeNativeContentBlocks(source);
     let updatedExisting = 0;
     let lastTextIndex = -1;
     for (let i = 0; i < parts.length; i++) {
@@ -2116,6 +2099,8 @@ function applyCacheControlToContent(content, ttl) {
 
 function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
     if (!settings().claudeOneHourCache || !isClaudeCustomRequest(body)) return null;
+
+    body.messages = sanitizeClaudeSourceMessages(body.messages);
 
     const native = buildNativeClaudeRequest(body);
     const nativeUrl = buildNativeClaudeTunnelUrl(body.custom_url);
@@ -2156,15 +2141,19 @@ function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
     }
 
     const breakpointIndices = [];
+    let leadingSystemMessageCount = 0;
     for (let i = 0; i < body.messages.length; i++) {
         if (body.messages[i]?.role !== 'system') break;
-        breakpointIndices.push(i);
+        leadingSystemMessageCount++;
+        if (toNativeContentBlocks(body.messages[i].content).some(part => part.type === 'text')) {
+            breakpointIndices.push(i);
+        }
     }
     if (!breakpointIndices.length) return null;
     const targets = breakpointIndices.slice(-2);
 
     let updatedExisting = 0;
-    for (let i = 0; i <= breakpointIndices[breakpointIndices.length - 1]; i++) {
+    for (let i = 0; i < leadingSystemMessageCount; i++) {
         const message = body.messages[i];
         if (message?.cache_control) {
             message.cache_control = { ...message.cache_control, type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
