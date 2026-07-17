@@ -8,6 +8,7 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 
 ```text
 /api/backends/chat-completions/generate
+/api/plugins/baibaoku/v1/chats/save-generate
 ```
 
 的请求，并在不修改 SillyTavern 后端源码、不修改 NewAPI 的情况下做缓存友好化处理。
@@ -175,3 +176,10 @@ cache_creation.ephemeral_1h_input_tokens > 0
 - 补齐 Claude Code 请求中的稳定 `metadata.user_id`，为每个浏览器安装生成设备 ID，并按具体聊天、模型和稳定 system 前缀生成固定 session ID。
 - 修复部分多上游运营商中“完全相同请求可读取 1h，但对话增长超过约 5 分钟就全量重写”的缓存分片问题。
 - 实测 Opus 4.6 冷写后静置 6 分 30 秒，再追加一轮仍能读取旧前缀，只写入新增 token。
+
+## 0.10.6
+
+- 兼容 `ST-BaiBai-Tools` 的“生成并保存”请求封装：即使它先把主请求改道到 `/api/plugins/baibaoku/v1/chats/save-generate`，仍会优化其中的 `generate` 请求体并注入 Claude 原生 1 小时缓存。
+- 该兼容路径会把上游原生 Claude 流暂时改为非流式 JSON，让 BaiBaoKu 后端能够正确解析并保存回复；返回浏览器时再恢复为 SillyTavern 请求的 OpenAI-compatible SSE 格式。
+- 修复并行加载扩展时 fetch hook 顺序不稳定，导致同一套设置有时写入 1 小时、有时退回默认 5 分钟的问题。
+- 修正动态块识别：`<observed_piece>`、记忆简报、时间锚点和本轮剧情指令留在 user 侧；大型稳定预设不再因为内部出现 `[RULE:]` 一类文本而被误判为动态块。连续两轮可读取稳定 system 前缀，仅重写本轮动态部分。

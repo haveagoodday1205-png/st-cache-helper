@@ -1,8 +1,14 @@
 import { extension_settings, getContext } from '../../../extensions.js';
-import { saveSettingsDebounced, substituteParams } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, substituteParams } from '../../../../script.js';
 import { getChatCompletionPreset } from '../../../openai.js';
 
 const MODULE = 'st_cache_helper';
+const CHAT_COMPLETIONS_GENERATE_PATH = '/api/backends/chat-completions/generate';
+const BAIBAOKU_SAVE_GENERATE_PATH = '/api/plugins/baibaoku/v1/chats/save-generate';
+const BAIBAOKU_SAVE_GENERATE_FETCH_STATE_KEY = '__baiBaiToolkitSaveGenerateFetchPatched';
+const FETCH_PATCH_META_KEY = '__stCacheHelperFetchPatchMeta';
+const FETCH_PATCH_ROLE_GLOBAL = 'global';
+const FETCH_PATCH_ROLE_BAIBAOKU_DOWNSTREAM = 'baibaoku-downstream';
 const STABLE_DEPTH_ORDER_KEY = 'st_cache_helper_stable_depth_order_v1';
 const CLAUDE_ONE_HOUR_CACHE_TTL = '1h';
 const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-scope-2026-01-05', 'extended-cache-ttl-2025-04-11'];
@@ -768,7 +774,13 @@ function isSelectiveNativeLoreBlock(block) {
     if (block?.type !== 'text') return false;
     const text = String(block.text || '');
     if (text.length < 300) return false;
-    return /^\s*\[\s*[^\]\n]{1,160}:/m.test(text) || /<\/?Example_Responses>/i.test(text);
+    // Match wrappers that carry per-turn memory, state, or the live user
+    // instruction. Do not scan every line for generic "[RULE:" shapes: large
+    // stable presets commonly contain those deep inside the document and were
+    // being moved out of the cacheable system prefix by mistake.
+    if (/<observed_piece\b/i.test(text)) return true;
+    if (/(?:记忆系统私密简报|下段剧情指令|时间锚点要求|current\s+(?:state|scene|time))/i.test(text)) return true;
+    return /^\s*\[\s*[^\]\n]{1,160}\s*[:：]/.test(text) || /<\/?Example_Responses>/i.test(text);
 }
 
 function buildNativeSystem(messages, model) {
@@ -1603,35 +1615,100 @@ async function convertNativeClaudeResponse(response, streamRequested) {
     return new Response(JSON.stringify(converted), { status: response.status, statusText: response.statusText, headers });
 }
 
-function installFetchPatch() {
-    if (window.__stCacheHelperFetchPatched) return;
-    window.__stCacheHelperFetchPatched = true;
+function fetchRequestMatchesPath(input, expectedPath) {
+    const rawUrl = typeof input === 'string' ? input : input?.url;
+    if (typeof rawUrl !== 'string') return false;
+    try {
+        return new URL(rawUrl, location.href).pathname === expectedPath;
+    } catch {
+        return false;
+    }
+}
 
-    const originalFetch = window.fetch.bind(window);
-    window.fetch = async function patchedFetch(input, init = {}) {
+function isNativeClaudeTunnelRequest(body) {
+    if (!isClaudeCustomRequest(body)) return false;
+    try {
+        if (!new URL(String(body?.custom_url || '')).pathname.endsWith('/messages')) return false;
+    } catch {
+        return false;
+    }
+    try {
+        const native = JSON.parse(body.custom_include_body || '');
+        return native?.model === body.model && Array.isArray(native?.messages) && Array.isArray(native?.system);
+    } catch {
+        return false;
+    }
+}
+
+function shouldDeferStandardGenerateToBaiBaoKu(role) {
+    if (role === FETCH_PATCH_ROLE_BAIBAOKU_DOWNSTREAM) return false;
+    const state = window[BAIBAOKU_SAVE_GENERATE_FETCH_STATE_KEY];
+    return !!state?.wrappedFetch && !!state?.originalFetch?.[FETCH_PATCH_META_KEY];
+}
+
+function createFetchPatch(originalFetch, role = FETCH_PATCH_ROLE_GLOBAL) {
+    const patchMeta = { role };
+    async function patchedFetch(input, init = {}) {
         let nativeClaudeTransport = null;
         try {
-            const url = typeof input === 'string' ? input : input?.url;
-            const isGenerate = typeof url === 'string' && url.includes('/api/backends/chat-completions/generate');
-            if (isGenerate && init?.body && typeof init.body === 'string') {
-                const body = JSON.parse(init.body);
-                if (shouldTouchBody(body)) {
+            const isGenerate = fetchRequestMatchesPath(input, CHAT_COMPLETIONS_GENERATE_PATH);
+            const isBaiBaoKuSaveGenerate = fetchRequestMatchesPath(input, BAIBAOKU_SAVE_GENERATE_PATH);
+            if (isGenerate && shouldDeferStandardGenerateToBaiBaoKu(patchMeta.role)) {
+                return originalFetch.call(window, input, init);
+            }
+            if ((isGenerate || isBaiBaoKuSaveGenerate) && init?.body && typeof init.body === 'string') {
+                const envelope = JSON.parse(init.body);
+                const body = isBaiBaoKuSaveGenerate ? envelope?.generate : envelope;
+                const streamRequested = !!body?.stream;
+
+                // BaiBai Tools can wrap the normal generate request in a
+                // save-generate envelope before this fetch patch sees it. Its
+                // server-side stream collector expects OpenAI-compatible SSE,
+                // while the 1h tunnel deliberately returns Anthropic-native
+                // SSE. Buffer this compatibility route as native JSON so
+                // BaiBai can persist the assistant message, then convert that
+                // JSON back to the streaming shape requested by SillyTavern.
+                const bufferBaiBaoKuNativeResponse = isBaiBaoKuSaveGenerate
+                    && streamRequested
+                    && settings().claudeOneHourCache
+                    && isClaudeCustomRequest(body)
+                    && canUseNativeClaudeTransport(body);
+                if (bufferBaiBaoKuNativeResponse) body.stream = false;
+
+                if (!isNativeClaudeTunnelRequest(body) && shouldTouchBody(body)) {
                     const changed = applyOptimization(body);
                     if (changed) {
                         if (changed.claudeOneHourCache?.transport === 'anthropic-native') {
-                            nativeClaudeTransport = { streamRequested: !!body.stream };
+                            nativeClaudeTransport = {
+                                streamRequested,
+                                route: isBaiBaoKuSaveGenerate ? 'baibaoku-save-generate' : 'standard-generate',
+                                buffered: bufferBaiBaoKuNativeResponse,
+                            };
+                        } else if (bufferBaiBaoKuNativeResponse) {
+                            body.stream = streamRequested;
                         }
                         init = { ...init, body: JSON.stringify(body) };
-                        if (settings().log) console.info('[ST Cache Helper] optimized request', changed);
+                        if (isBaiBaoKuSaveGenerate) {
+                            envelope.generate = body;
+                            init = { ...init, body: JSON.stringify(envelope) };
+                        }
+                        if (settings().log) console.info('[ST Cache Helper] optimized request', {
+                            ...changed,
+                            route: nativeClaudeTransport?.route || (isBaiBaoKuSaveGenerate ? 'baibaoku-save-generate' : 'standard-generate'),
+                            bufferedNativeResponse: nativeClaudeTransport?.buffered === true,
+                        });
                     } else if (settings().log) {
+                        if (bufferBaiBaoKuNativeResponse) body.stream = streamRequested;
                         console.debug('[ST Cache Helper] no optimization', { post: body.custom_prompt_post_processing || '', ...summarizeMessages(body.messages) });
                     }
+                } else if (bufferBaiBaoKuNativeResponse) {
+                    body.stream = streamRequested;
                 }
             }
         } catch (err) {
             console.warn('[ST Cache Helper] fetch patch error', err);
         }
-        const response = await originalFetch(input, init);
+        const response = await originalFetch.call(window, input, init);
         if (nativeClaudeTransport) {
             try {
                 return await convertNativeClaudeResponse(response, nativeClaudeTransport.streamRequested);
@@ -1640,7 +1717,61 @@ function installFetchPatch() {
             }
         }
         return response;
-    };
+    }
+
+    Object.defineProperty(patchedFetch, FETCH_PATCH_META_KEY, {
+        configurable: true,
+        value: patchMeta,
+    });
+    return patchedFetch;
+}
+
+function patchBaiBaoKuDownstreamFetch() {
+    const state = window[BAIBAOKU_SAVE_GENERATE_FETCH_STATE_KEY];
+    if (!state || typeof state.originalFetch !== 'function') return false;
+
+    const existingMeta = state.originalFetch[FETCH_PATCH_META_KEY];
+    if (existingMeta) {
+        const changed = existingMeta.role !== FETCH_PATCH_ROLE_BAIBAOKU_DOWNSTREAM;
+        existingMeta.role = FETCH_PATCH_ROLE_BAIBAOKU_DOWNSTREAM;
+        return changed;
+    }
+
+    state.originalFetch = createFetchPatch(state.originalFetch, FETCH_PATCH_ROLE_BAIBAOKU_DOWNSTREAM);
+    return true;
+}
+
+function ensureFetchPatch(reason = 'manual') {
+    const baiBaoKuPatched = patchBaiBaoKuDownstreamFetch();
+    let globalPatched = false;
+    if (!window.fetch?.[FETCH_PATCH_META_KEY]) {
+        window.fetch = createFetchPatch(window.fetch, FETCH_PATCH_ROLE_GLOBAL);
+        globalPatched = true;
+    }
+    window.__stCacheHelperFetchPatched = true;
+    if (settings().log && (globalPatched || baiBaoKuPatched)) {
+        console.debug('[ST Cache Helper] fetch patch ensured', { reason, globalPatched, baiBaoKuPatched });
+    }
+}
+
+function installFetchPatch() {
+    ensureFetchPatch('init');
+
+    for (const eventName of [
+        event_types.EXTENSIONS_FIRST_LOAD,
+        event_types.EXTENSION_SETTINGS_LOADED,
+        event_types.APP_READY,
+        event_types.CHAT_COMPLETION_SETTINGS_READY,
+    ]) {
+        if (eventName) eventSource.on(eventName, () => ensureFetchPatch(eventName));
+    }
+
+    // Some performance extensions install fetch wrappers asynchronously after
+    // EXTENSIONS_FIRST_LOAD. These bounded checks repair that late replacement
+    // without leaving a permanent polling timer behind.
+    for (const delay of [1_000, 3_000, 10_000, 30_000, 60_000]) {
+        setTimeout(() => ensureFetchPatch(`delayed-${delay}`), delay);
+    }
 }
 
 function addPanel() {
