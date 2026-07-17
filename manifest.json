@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Codex",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "homePage": "https://github.com/haveagoodday1205-png/st-cache-helper",
   "hooks": {
     "activate": "init"
