@@ -218,3 +218,9 @@ epoch-reset  修订日志达到容量边界，本轮重新冷写
 - 原生 Claude 与 OpenAI-compatible 回退路径现在统一过滤字符串、数组和纯空白形式的空文本块，并为清理后为空的 user/assistant 消息加入安全占位内容。
 - system 与 conversation 增量日志在读取旧 `sessionStorage` 快照时也会清理无效块，防止升级后继续复用此前保存的空内容。
 - 最终 `/v1/messages` 请求发送前再次执行完整性清理并重新核算缓存断点，避免其他插件或旧日志重新引入非法文本块。
+
+## 0.11.2
+
+- 修复 `ST-BaiBai-Tools` 与 Claude 原生 1 小时缓存同时启用时，流式请求被强制缓冲为非流式并可能触发上游 Cloudflare 524 的问题。
+- 该组合现在自动解开 `save-generate` 信封并直接调用 SillyTavern 标准生成端点，保持 Anthropic 原生流式响应，再转换为前端需要的 OpenAI-compatible SSE。
+- 普通 BaiBai 请求、非流式请求和 OpenAI-compatible 回退仍使用原路径；旁路请求保留原有请求头、凭据和取消信号，并由 SillyTavern 正常保存聊天。

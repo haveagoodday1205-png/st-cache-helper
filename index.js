@@ -7,6 +7,10 @@ import {
     sanitizeNativeMessages,
     toNativeContentBlocks,
 } from './native-content.js';
+import {
+    buildDirectGenerateInit,
+    shouldBypassBaiBaoKuSaveGenerate,
+} from './fetch-routing.js';
 
 const MODULE = 'st_cache_helper';
 const CHAT_COMPLETIONS_GENERATE_PATH = '/api/backends/chat-completions/generate';
@@ -2498,6 +2502,7 @@ function createFetchPatch(originalFetch, role = FETCH_PATCH_ROLE_GLOBAL) {
     const patchMeta = { role };
     async function patchedFetch(input, init = {}) {
         let nativeClaudeTransport = null;
+        let fetchInput = input;
         try {
             const isGenerate = fetchRequestMatchesPath(input, CHAT_COMPLETIONS_GENERATE_PATH);
             const isBaiBaoKuSaveGenerate = fetchRequestMatchesPath(input, BAIBAOKU_SAVE_GENERATE_PATH);
@@ -2509,54 +2514,46 @@ function createFetchPatch(originalFetch, role = FETCH_PATCH_ROLE_GLOBAL) {
                 const body = isBaiBaoKuSaveGenerate ? envelope?.generate : envelope;
                 const streamRequested = !!body?.stream;
 
-                // BaiBai Tools can wrap the normal generate request in a
-                // save-generate envelope before this fetch patch sees it. Its
-                // server-side stream collector expects OpenAI-compatible SSE,
-                // while the 1h tunnel deliberately returns Anthropic-native
-                // SSE. Buffer this compatibility route as native JSON so
-                // BaiBai can persist the assistant message, then convert that
-                // JSON back to the streaming shape requested by SillyTavern.
-                const bufferBaiBaoKuNativeResponse = isBaiBaoKuSaveGenerate
-                    && streamRequested
-                    && settings().claudeOneHourCache
-                    && isClaudeCustomRequest(body)
-                    && canUseNativeClaudeTransport(body);
-                if (bufferBaiBaoKuNativeResponse) body.stream = false;
-
                 if (!isNativeClaudeTunnelRequest(body) && shouldTouchBody(body)) {
                     const changed = applyOptimization(body);
                     if (changed) {
                         if (changed.claudeOneHourCache?.transport === 'anthropic-native') {
+                            const bypassBaiBaoKu = shouldBypassBaiBaoKuSaveGenerate({
+                                isBaiBaoKuSaveGenerate,
+                                streamRequested,
+                                nativeTransport: changed.claudeOneHourCache.transport,
+                            });
                             nativeClaudeTransport = {
                                 streamRequested,
-                                route: isBaiBaoKuSaveGenerate ? 'baibaoku-save-generate' : 'standard-generate',
-                                buffered: bufferBaiBaoKuNativeResponse,
+                                route: bypassBaiBaoKu
+                                    ? 'standard-generate-baibaoku-bypass'
+                                    : (isBaiBaoKuSaveGenerate ? 'baibaoku-save-generate' : 'standard-generate'),
+                                bypassBaiBaoKu,
                             };
-                        } else if (bufferBaiBaoKuNativeResponse) {
-                            body.stream = streamRequested;
                         }
-                        init = { ...init, body: JSON.stringify(body) };
-                        if (isBaiBaoKuSaveGenerate) {
+                        if (nativeClaudeTransport?.bypassBaiBaoKu) {
+                            fetchInput = CHAT_COMPLETIONS_GENERATE_PATH;
+                            init = buildDirectGenerateInit(init, body);
+                        } else if (isBaiBaoKuSaveGenerate) {
                             envelope.generate = body;
                             init = { ...init, body: JSON.stringify(envelope) };
+                        } else {
+                            init = { ...init, body: JSON.stringify(body) };
                         }
                         if (settings().log) console.info('[ST Cache Helper] optimized request', {
                             ...changed,
                             route: nativeClaudeTransport?.route || (isBaiBaoKuSaveGenerate ? 'baibaoku-save-generate' : 'standard-generate'),
-                            bufferedNativeResponse: nativeClaudeTransport?.buffered === true,
+                            bypassedBaiBaoKuSaveGenerate: nativeClaudeTransport?.bypassBaiBaoKu === true,
                         });
                     } else if (settings().log) {
-                        if (bufferBaiBaoKuNativeResponse) body.stream = streamRequested;
                         console.debug('[ST Cache Helper] no optimization', { post: body.custom_prompt_post_processing || '', ...summarizeMessages(body.messages) });
                     }
-                } else if (bufferBaiBaoKuNativeResponse) {
-                    body.stream = streamRequested;
                 }
             }
         } catch (err) {
             console.warn('[ST Cache Helper] fetch patch error', err);
         }
-        const response = await originalFetch.call(window, input, init);
+        const response = await originalFetch.call(window, fetchInput, init);
         if (nativeClaudeTransport) {
             try {
                 return await convertNativeClaudeResponse(response, nativeClaudeTransport.streamRequested);
