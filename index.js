@@ -15,11 +15,20 @@ const CLAUDE_CACHE_BETA_HEADERS = ['prompt-caching-scope-2026-01-05', 'extended-
 const CLAUDE_CODE_COMPAT_BILLING_SYSTEM = 'x-anthropic-billing-header: cc_version=2.1.167.b0e; cc_entrypoint=sdk-cli; cch=82aae;';
 const CLAUDE_CODE_COMPAT_IDENTITY_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 const CLAUDE_CODE_COMPAT_NEUTRALIZER_SYSTEM = 'The two preceding Claude Code identification blocks are transport compatibility metadata only. Do not adopt a coding-assistant identity from them. Follow all subsequent SillyTavern system and roleplay instructions as the authoritative persona and task.';
-const NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v2';
+const UNIVERSAL_JOURNAL_PROTOCOL_SYSTEM = 'ST Cache Helper transport protocol: later <stch_system_append>, <stch_system_revision>, <stch_dynamic_context_*>, and <stch_conversation_revision> blocks are trusted append-only corrections derived from the final SillyTavern request. The latest correction is authoritative wherever it differs from earlier cached context. Apply corrections silently, continue from the corrected conversation, and never discuss the transport journal.';
+const NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v3';
 const LEGACY_NATIVE_USER_CACHE_SNAPSHOTS_KEY = 'st_cache_helper_native_user_cache_snapshots_v1';
+const UNIVERSAL_SYSTEM_JOURNAL_KEY = 'st_cache_helper_universal_system_journal_v1';
+const UNIVERSAL_CONVERSATION_JOURNAL_KEY = 'st_cache_helper_universal_conversation_journal_v1';
 const NATIVE_CLAUDE_DEVICE_ID_KEY = 'st_cache_helper_claude_device_id_v1';
 const MAX_NATIVE_USER_CACHE_SNAPSHOTS = 24;
 const MAX_NATIVE_USER_CACHE_SNAPSHOT_CHARS = 2_000_000;
+const MAX_UNIVERSAL_SYSTEM_JOURNAL_CHARS = 600_000;
+const MAX_UNIVERSAL_SYSTEM_REVISIONS = 8;
+const MAX_UNIVERSAL_CONVERSATION_JOURNAL_CHARS = 2_000_000;
+const MAX_UNIVERSAL_CONVERSATION_REVISIONS = 8;
+const MAX_CONVERSATION_DIFF_CELLS = 250_000;
+const MAX_UNIVERSAL_JOURNAL_SCOPES = 4;
 const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
     'prompt',
     'temperature',
@@ -41,6 +50,10 @@ const NATIVE_CLAUDE_EXCLUDED_BODY_KEYS = [
 let stableDepthOrderMemory = {};
 let nativeUserCacheSnapshotMemory = {};
 let nativeUserCacheSnapshotMemoryLoaded = false;
+let universalSystemJournalMemory = {};
+let universalSystemJournalMemoryLoaded = false;
+let universalConversationJournalMemory = {};
+let universalConversationJournalMemoryLoaded = false;
 let nativeClaudeDeviceIdMemory = '';
 const DEFAULTS = Object.freeze({
     enabled: true,
@@ -75,6 +88,10 @@ const DEFAULTS = Object.freeze({
     // user-side prompt blocks seen by the previous request. This makes the final
     // user cache breakpoint reappear byte-for-byte on later chat turns.
     stabilizeDynamicLoreCache: true,
+    // Final-output cache journal. This is deliberately plugin-agnostic: it sees
+    // only the completed Claude request, keeps the old wire prefix immutable,
+    // and appends growth/revisions produced by any upstream extension.
+    universalIncrementalCache: true,
 });
 
 const POST_TYPES = new Set(['strict', 'strict_tools', 'semi', 'semi_tools', 'merge', 'merge_tools', 'single', 'claude']);
@@ -783,7 +800,203 @@ function isSelectiveNativeLoreBlock(block) {
     return /^\s*\[\s*[^\]\n]{1,160}\s*[:：]/.test(text) || /<\/?Example_Responses>/i.test(text);
 }
 
-function buildNativeSystem(messages, model) {
+function cloneNativeTextBlocks(blocks) {
+    return blocks.map(block => {
+        const clone = structuredClone(block);
+        delete clone.cache_control;
+        return clone;
+    });
+}
+
+function universalSystemJournalScope(body) {
+    return hashText([
+        currentNativeChatIdentity(),
+        body?.custom_url || '',
+        body?.model || '',
+        body?.char_name || '',
+        body?.user_name || '',
+    ].join('\n'));
+}
+
+function loadUniversalSystemJournalStore() {
+    if (universalSystemJournalMemoryLoaded) return universalSystemJournalMemory;
+    universalSystemJournalMemoryLoaded = true;
+    try {
+        const raw = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(UNIVERSAL_SYSTEM_JOURNAL_KEY) : '';
+        const parsed = raw ? JSON.parse(raw) : {};
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) universalSystemJournalMemory = parsed;
+    } catch { /* noop */ }
+    return universalSystemJournalMemory;
+}
+
+function trimUniversalJournalScopes(store, activeScope) {
+    const scopes = Object.keys(store).sort((left, right) => (
+        Number(store[right]?.savedAt || 0) - Number(store[left]?.savedAt || 0)
+    ));
+    const keep = new Set([activeScope, ...scopes.filter(scope => scope !== activeScope).slice(0, MAX_UNIVERSAL_JOURNAL_SCOPES - 1)]);
+    for (const scope of scopes) {
+        if (!keep.has(scope)) delete store[scope];
+    }
+}
+
+function saveUniversalSystemJournalStore(store) {
+    universalSystemJournalMemory = store;
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem(UNIVERSAL_SYSTEM_JOURNAL_KEY, JSON.stringify(store));
+        }
+    } catch { /* keep in memory */ }
+}
+
+function systemBlockTexts(blocks) {
+    return blocks.map(block => String(block?.text || ''));
+}
+
+function sameStringArray(left, right) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function stringArrayStartsWith(values, prefix) {
+    return values.length >= prefix.length && prefix.every((value, index) => values[index] === value);
+}
+
+function appendedSystemBlocks(currentBlocks, currentTexts, previousTexts) {
+    if (stringArrayStartsWith(currentTexts, previousTexts)) {
+        return cloneNativeTextBlocks(currentBlocks.slice(previousTexts.length));
+    }
+    if (!previousTexts.length || currentTexts.length < previousTexts.length) return null;
+
+    const lastPreviousIndex = previousTexts.length - 1;
+    for (let index = 0; index < lastPreviousIndex; index++) {
+        if (currentTexts[index] !== previousTexts[index]) return null;
+    }
+    const previousTail = previousTexts[lastPreviousIndex];
+    const currentTail = currentTexts[lastPreviousIndex];
+    if (!currentTail.startsWith(previousTail)) return null;
+
+    const suffix = currentTail.slice(previousTail.length);
+    const appended = [];
+    if (suffix) appended.push({ ...structuredClone(currentBlocks[lastPreviousIndex]), text: suffix });
+    appended.push(...cloneNativeTextBlocks(currentBlocks.slice(previousTexts.length)));
+    return appended.length ? appended : null;
+}
+
+function buildSystemRevisionBlock(currentTexts, revision) {
+    const sections = currentTexts.map((text, index) => (
+        `<stch_system_block index="${index}">\n${text}\n</stch_system_block>`
+    ));
+    return {
+        type: 'text',
+        text: [
+            `<stch_system_revision number="${revision}">`,
+            'The following is the current authoritative system context. Where it differs from earlier cached system context, this revision supersedes the earlier version.',
+            ...sections,
+            '</stch_system_revision>',
+        ].join('\n\n'),
+    };
+}
+
+function buildSystemAppendBlock(appendedBlocks, revision) {
+    const sections = appendedBlocks.map((block, index) => (
+        `<stch_system_append_block index="${index}">\n${String(block?.text || '')}\n</stch_system_append_block>`
+    ));
+    return {
+        type: 'text',
+        text: [
+            `<stch_system_append number="${revision}">`,
+            'Append the following blocks to the current authoritative system context in this order.',
+            ...sections,
+            '</stch_system_append>',
+        ].join('\n\n'),
+    };
+}
+
+function addUniversalJournalProtocol(blocks) {
+    return [
+        ...cloneNativeTextBlocks(blocks),
+        { type: 'text', text: UNIVERSAL_JOURNAL_PROTOCOL_SYSTEM },
+    ];
+}
+
+function stabilizeUniversalSystemBlocks(blocks, body) {
+    const current = cloneNativeTextBlocks(blocks);
+    const currentTexts = systemBlockTexts(current);
+    const freshWire = current.length === 1 ? splitNativeSystemBlock(current[0]) : current;
+    if (!settings().universalIncrementalCache) {
+        return {
+            blocks: freshWire,
+            epochHash: hashText(currentTexts.join('\n---STCH-SYSTEM---\n')),
+            status: 'disabled',
+            revision: 0,
+            appendedChars: currentTexts.reduce((sum, text) => sum + text.length, 0),
+            deferredContextBlocks: [],
+        };
+    }
+
+    const store = loadUniversalSystemJournalStore();
+    const scope = universalSystemJournalScope(body);
+    const previous = store[scope];
+    let wire = addUniversalJournalProtocol(freshWire);
+    let revision = 0;
+    let status = 'created';
+    let epochHash = hashText(currentTexts.join('\n---STCH-SYSTEM---\n'));
+    let appendedChars = currentTexts.reduce((sum, text) => sum + text.length, 0);
+    let accumulatedJournalChars = 0;
+    let deferredContextBlocks = [];
+
+    if (previous?.protocolVersion === 1 && Array.isArray(previous.logicalTexts) && Array.isArray(previous.wireBlocks)) {
+        const previousWire = cloneNativeTextBlocks(previous.wireBlocks);
+        revision = Number(previous.revision || 0);
+        epochHash = String(previous.epochHash || epochHash);
+        accumulatedJournalChars = Number(previous.accumulatedJournalChars || 0);
+        appendedChars = 0;
+        wire = previousWire;
+        if (sameStringArray(currentTexts, previous.logicalTexts)) {
+            status = 'reused';
+        } else {
+            revision++;
+            const appended = appendedSystemBlocks(current, currentTexts, previous.logicalTexts);
+            if (appended) {
+                const appendBlock = buildSystemAppendBlock(appended, revision);
+                deferredContextBlocks = [appendBlock];
+                appendedChars = appendBlock.text.length;
+                status = 'appended';
+            } else {
+                const revisionBlock = buildSystemRevisionBlock(currentTexts, revision);
+                deferredContextBlocks = [revisionBlock];
+                appendedChars = revisionBlock.text.length;
+                status = 'revised';
+            }
+            accumulatedJournalChars += appendedChars;
+        }
+    }
+
+    const journalIsBloated = accumulatedJournalChars > MAX_UNIVERSAL_SYSTEM_JOURNAL_CHARS;
+    if (revision > MAX_UNIVERSAL_SYSTEM_REVISIONS || journalIsBloated) {
+        wire = addUniversalJournalProtocol(freshWire);
+        revision = 0;
+        epochHash = hashText(`${Date.now()}:${Math.random()}:${currentTexts.join('\n---STCH-SYSTEM---\n')}`);
+        appendedChars = currentTexts.reduce((sum, text) => sum + text.length, 0);
+        accumulatedJournalChars = 0;
+        deferredContextBlocks = [];
+        status = 'epoch-reset';
+    }
+
+    store[scope] = {
+        protocolVersion: 1,
+        logicalTexts: currentTexts,
+        wireBlocks: cloneNativeTextBlocks(wire),
+        revision,
+        accumulatedJournalChars,
+        epochHash,
+        savedAt: Date.now(),
+    };
+    trimUniversalJournalScopes(store, scope);
+    saveUniversalSystemJournalStore(store);
+    return { blocks: wire, epochHash, status, revision, appendedChars, deferredContextBlocks };
+}
+
+function buildNativeSystem(messages, model, body) {
     let blocks = [];
     let dynamicLoreBlocks = [];
     let leadingSystemMessages = 0;
@@ -810,7 +1023,8 @@ function buildNativeSystem(messages, model) {
             dynamicLoreBlocks = dynamic;
         }
     }
-    if (blocks.length === 1) blocks.splice(0, 1, ...splitNativeSystemBlock(blocks[0]));
+    const universalJournal = stabilizeUniversalSystemBlocks(blocks, body);
+    blocks = universalJournal.blocks;
 
     const cacheControl = { type: 'ephemeral', ttl: CLAUDE_ONE_HOUR_CACHE_TTL };
     let cacheBreakpointCount = Math.min(2, blocks.length);
@@ -832,10 +1046,16 @@ function buildNativeSystem(messages, model) {
     return {
         blocks,
         dynamicLoreBlocks,
+        deferredContextBlocks: universalJournal.deferredContextBlocks,
+        universalSystemJournal: {
+            status: universalJournal.status,
+            revision: universalJournal.revision,
+            appendedChars: universalJournal.appendedChars,
+        },
         leadingSystemMessages,
         cacheBreakpointCount,
         claudeCodeCompatPrefix,
-        stableSystemHash: hashText(blocks.map(block => contentToText(block)).join('\n---STCH-SYSTEM---\n')),
+        stableSystemHash: universalJournal.epochHash,
     };
 }
 
@@ -997,6 +1217,435 @@ function nativeUserSnapshotScope(body, stableSystemHash) {
     ].join('\n'));
 }
 
+function cloneNativeConversationMessages(messages) {
+    return (Array.isArray(messages) ? messages : []).map(message => {
+        const clone = structuredClone(message);
+        delete clone.cache_control;
+        clone.content = cloneNativeContentWithoutCacheControl(clone.content);
+        return clone;
+    });
+}
+
+function extractNativeUserSideContext(messages) {
+    const logicalMessages = cloneNativeConversationMessages(messages);
+    let latestUserIndex = -1;
+    for (let index = logicalMessages.length - 1; index >= 0; index--) {
+        if (logicalMessages[index]?.role === 'user') {
+            latestUserIndex = index;
+            break;
+        }
+    }
+
+    const contextBlocks = [];
+    let strippedHistoricalBlocks = 0;
+    for (let messageIndex = 0; messageIndex < logicalMessages.length; messageIndex++) {
+        const message = logicalMessages[messageIndex];
+        if (message?.role !== 'user' || !Array.isArray(message.content)) continue;
+        let keptPrimaryText = false;
+        const kept = [];
+        for (const block of message.content) {
+            if (block?.type !== 'text' || !String(block.text || '').length) {
+                kept.push(block);
+                continue;
+            }
+            if (!keptPrimaryText) {
+                kept.push(block);
+                keptPrimaryText = true;
+                continue;
+            }
+            if (messageIndex === latestUserIndex) contextBlocks.push({ type: 'text', text: String(block.text) });
+            else strippedHistoricalBlocks++;
+        }
+        message.content = kept.length ? kept : [{ type: 'text', text: '...' }];
+    }
+    return { messages: logicalMessages, contextBlocks, strippedHistoricalBlocks };
+}
+
+function sameNativeValue(left, right) {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function nativeValueWithoutKey(value, key) {
+    const clone = structuredClone(value);
+    delete clone[key];
+    return clone;
+}
+
+function nativeContentAppendDelta(currentContent, previousContent) {
+    const current = cloneNativeContentWithoutCacheControl(currentContent);
+    const previous = cloneNativeContentWithoutCacheControl(previousContent);
+    if (!previous.length) return current;
+    if (current.length < previous.length) return null;
+
+    let exactBlockPrefix = true;
+    for (let index = 0; index < previous.length; index++) {
+        if (!sameNativeValue(current[index], previous[index])) {
+            exactBlockPrefix = false;
+            break;
+        }
+    }
+    if (exactBlockPrefix) return current.slice(previous.length);
+
+    const tailIndex = previous.length - 1;
+    for (let index = 0; index < tailIndex; index++) {
+        if (!sameNativeValue(current[index], previous[index])) return null;
+    }
+    const previousTail = previous[tailIndex];
+    const currentTail = current[tailIndex];
+    if (previousTail?.type !== 'text' || currentTail?.type !== 'text') return null;
+    if (!sameNativeValue(nativeValueWithoutKey(currentTail, 'text'), nativeValueWithoutKey(previousTail, 'text'))) return null;
+
+    const previousText = String(previousTail.text || '');
+    const currentText = String(currentTail.text || '');
+    if (!currentText.startsWith(previousText)) return null;
+    const suffix = currentText.slice(previousText.length);
+    const appended = [];
+    if (suffix) appended.push({ ...currentTail, text: suffix });
+    appended.push(...current.slice(previous.length));
+    return appended.length ? appended : null;
+}
+
+function nativeConversationAppendDelta(currentMessages, previousMessages) {
+    const current = cloneNativeConversationMessages(currentMessages);
+    const previous = cloneNativeConversationMessages(previousMessages);
+    if (!previous.length) return current;
+    if (current.length < previous.length) return null;
+
+    const lastPreviousIndex = previous.length - 1;
+    for (let index = 0; index < lastPreviousIndex; index++) {
+        if (!sameNativeValue(current[index], previous[index])) return null;
+    }
+    const previousTail = previous[lastPreviousIndex];
+    const currentTail = current[lastPreviousIndex];
+    if (sameNativeValue(currentTail, previousTail)) return current.slice(previous.length);
+    if (currentTail?.role !== previousTail?.role) return null;
+    if (!sameNativeValue(nativeValueWithoutKey(currentTail, 'content'), nativeValueWithoutKey(previousTail, 'content'))) return null;
+
+    const contentDelta = nativeContentAppendDelta(currentTail.content, previousTail.content);
+    if (!contentDelta?.length) return null;
+    return [
+        { ...nativeValueWithoutKey(currentTail, 'content'), content: contentDelta },
+        ...current.slice(previous.length),
+    ];
+}
+
+function appendNativeConversationMessages(baseMessages, appendedMessages) {
+    const out = cloneNativeConversationMessages(baseMessages);
+    for (const message of cloneNativeConversationMessages(appendedMessages)) {
+        if (!message?.role || !Array.isArray(message.content) || !message.content.length) continue;
+        const previous = out[out.length - 1];
+        if (previous?.role === message.role) previous.content.push(...message.content);
+        else out.push(message);
+    }
+    return out;
+}
+
+function appendJournalContextBlocks(messages, blocks) {
+    const wire = cloneNativeConversationMessages(messages);
+    if (!Array.isArray(blocks) || !blocks.length) return wire;
+    const currentUser = [...wire].reverse().find(message => message?.role === 'user' && Array.isArray(message.content));
+    if (!currentUser) return wire;
+    currentUser.content.push(...cloneNativeContentWithoutCacheControl(blocks));
+    return wire;
+}
+
+function nativeConversationCharCount(messages) {
+    let count = 0;
+    for (const message of messages) {
+        count += String(message?.role || '').length;
+        for (const block of Array.isArray(message?.content) ? message.content : []) {
+            count += block?.type === 'text' ? String(block.text || '').length : JSON.stringify(block ?? null).length;
+        }
+    }
+    return count;
+}
+
+function fallbackConversationMatches(previousSerialized, currentSerialized) {
+    const matches = [];
+    const limit = Math.min(previousSerialized.length, currentSerialized.length);
+    let prefix = 0;
+    while (prefix < limit && previousSerialized[prefix] === currentSerialized[prefix]) {
+        matches.push([prefix, prefix]);
+        prefix++;
+    }
+
+    const suffix = [];
+    let previousIndex = previousSerialized.length - 1;
+    let currentIndex = currentSerialized.length - 1;
+    while (previousIndex >= prefix && currentIndex >= prefix && previousSerialized[previousIndex] === currentSerialized[currentIndex]) {
+        suffix.push([previousIndex, currentIndex]);
+        previousIndex--;
+        currentIndex--;
+    }
+    return [...matches, ...suffix.reverse()];
+}
+
+function conversationLcsMatches(previousMessages, currentMessages) {
+    const previousSerialized = previousMessages.map(message => JSON.stringify(message));
+    const currentSerialized = currentMessages.map(message => JSON.stringify(message));
+    const previousCount = previousSerialized.length;
+    const currentCount = currentSerialized.length;
+    if (previousCount * currentCount > MAX_CONVERSATION_DIFF_CELLS) {
+        return fallbackConversationMatches(previousSerialized, currentSerialized);
+    }
+
+    const rows = Array.from({ length: previousCount + 1 }, () => new Uint16Array(currentCount + 1));
+    for (let previousIndex = previousCount - 1; previousIndex >= 0; previousIndex--) {
+        for (let currentIndex = currentCount - 1; currentIndex >= 0; currentIndex--) {
+            rows[previousIndex][currentIndex] = previousSerialized[previousIndex] === currentSerialized[currentIndex]
+                ? rows[previousIndex + 1][currentIndex + 1] + 1
+                : Math.max(rows[previousIndex + 1][currentIndex], rows[previousIndex][currentIndex + 1]);
+        }
+    }
+
+    const matches = [];
+    let previousIndex = 0;
+    let currentIndex = 0;
+    while (previousIndex < previousCount && currentIndex < currentCount) {
+        if (previousSerialized[previousIndex] === currentSerialized[currentIndex]) {
+            matches.push([previousIndex, currentIndex]);
+            previousIndex++;
+            currentIndex++;
+        } else if (rows[previousIndex + 1][currentIndex] >= rows[previousIndex][currentIndex + 1]) {
+            previousIndex++;
+        } else {
+            currentIndex++;
+        }
+    }
+    return matches;
+}
+
+function buildConversationRevisionOperations(previousMessages, currentMessages) {
+    const matches = conversationLcsMatches(previousMessages, currentMessages);
+    const operations = [];
+    let previousCursor = 0;
+    let currentCursor = 0;
+    for (const [previousMatch, currentMatch] of [...matches, [previousMessages.length, currentMessages.length]]) {
+        if (previousMatch > previousCursor || currentMatch > currentCursor) {
+            const removed = previousMessages.slice(previousCursor, previousMatch);
+            const inserted = currentMessages.slice(currentCursor, currentMatch);
+            if (removed.length === 1 && inserted.length === 1 && removed[0]?.role === inserted[0]?.role) {
+                const contentDelta = nativeContentAppendDelta(inserted[0].content, removed[0].content);
+                if (contentDelta?.length) {
+                    operations.push({
+                        type: 'append_content',
+                        previous_message_index: previousCursor,
+                        role: inserted[0].role,
+                        appended_content: contentDelta,
+                    });
+                } else {
+                    operations.push({
+                        type: 'splice',
+                        previous_start_index: previousCursor,
+                        delete_count: removed.length,
+                        current_start_index: currentCursor,
+                        insert_messages: inserted,
+                    });
+                }
+            } else {
+                operations.push({
+                    type: 'splice',
+                    previous_start_index: previousCursor,
+                    delete_count: removed.length,
+                    current_start_index: currentCursor,
+                    insert_messages: inserted,
+                });
+            }
+        }
+        previousCursor = previousMatch + 1;
+        currentCursor = currentMatch + 1;
+    }
+    return operations;
+}
+
+function buildConversationRevisionMessage(previousMessages, currentMessages, operations, revision) {
+    const patch = {
+        base_revision: revision - 1,
+        current_revision: revision,
+        base_message_count: previousMessages.length,
+        current_message_count: currentMessages.length,
+        base_digest: hashText(JSON.stringify(previousMessages)),
+        current_digest: hashText(JSON.stringify(currentMessages)),
+        operations,
+    };
+    return {
+        role: 'user',
+        content: [{
+            type: 'text',
+            text: [
+                `<stch_conversation_revision number="${revision}">`,
+                'This is an append-only cache-journal correction, not a new chat turn. Apply the JSON operations to the prior authoritative conversation state. All edits, deletions, insertions, and reordering in this revision supersede the older cached messages where they differ. Continue the roleplay or task from the final message of the corrected conversation; do not discuss this correction.',
+                '<stch_conversation_patch_json>',
+                JSON.stringify(patch),
+                '</stch_conversation_patch_json>',
+                '</stch_conversation_revision>',
+            ].join('\n'),
+        }],
+    };
+}
+
+function loadUniversalConversationJournalStore() {
+    if (universalConversationJournalMemoryLoaded) return universalConversationJournalMemory;
+    universalConversationJournalMemoryLoaded = true;
+    try {
+        const raw = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(UNIVERSAL_CONVERSATION_JOURNAL_KEY) : '';
+        const parsed = raw ? JSON.parse(raw) : {};
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) universalConversationJournalMemory = parsed;
+    } catch { /* noop */ }
+    return universalConversationJournalMemory;
+}
+
+function saveUniversalConversationJournalStore(store) {
+    universalConversationJournalMemory = store;
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem(UNIVERSAL_CONVERSATION_JOURNAL_KEY, JSON.stringify(store));
+        }
+    } catch { /* keep in memory */ }
+}
+
+function stabilizeUniversalConversationMessages(messages, body, stableSystemHash, dynamicLoreBlocks = [], deferredContextBlocks = []) {
+    const current = cloneNativeConversationMessages(messages);
+    const initialChars = nativeConversationCharCount(current);
+    if (!settings().universalIncrementalCache) {
+        return {
+            messages: current,
+            epochHash: '',
+            status: 'disabled',
+            revision: 0,
+            wirePrefixReused: false,
+            appendedMessages: current.length,
+            appendedChars: initialChars,
+            revisionOperations: 0,
+        };
+    }
+
+    const store = loadUniversalConversationJournalStore();
+    const scope = nativeUserSnapshotScope(body, stableSystemHash);
+    const previous = store[scope];
+    let wire = current;
+    let revision = 0;
+    let status = 'created';
+    let epochHash = hashText(`conversation-journal-v1:${scope}`);
+    let wirePrefixReused = false;
+    let appendedMessages = current.length;
+    let appendedChars = initialChars;
+    let revisionOperations = 0;
+    let contextWasCompacted = false;
+
+    if (previous && Array.isArray(previous.logicalMessages) && Array.isArray(previous.wireMessages)) {
+        const previousLogical = cloneNativeConversationMessages(previous.logicalMessages);
+        const previousWire = cloneNativeConversationMessages(previous.wireMessages);
+        revision = Number(previous.revision || 0);
+        epochHash = String(previous.epochHash || epochHash);
+        wirePrefixReused = true;
+        appendedMessages = 0;
+        appendedChars = 0;
+
+        if (sameNativeValue(current, previousLogical)) {
+            wire = previousWire;
+            status = 'reused';
+        } else {
+            const appendDelta = nativeConversationAppendDelta(current, previousLogical);
+            if (appendDelta) {
+                wire = appendNativeConversationMessages(previousWire, appendDelta);
+                status = 'appended';
+                appendedMessages = appendDelta.length;
+                appendedChars = nativeConversationCharCount(appendDelta);
+            } else {
+                revision++;
+                const operations = buildConversationRevisionOperations(previousLogical, current);
+                const firstOperation = operations[0];
+                const leadingRangeWasCompacted = firstOperation?.type === 'splice'
+                    && firstOperation.previous_start_index === 0
+                    && firstOperation.current_start_index === 0
+                    && firstOperation.delete_count >= 2
+                    && firstOperation.insert_messages.length < firstOperation.delete_count;
+                const conversationShrankSubstantially = current.length + 4 < previousLogical.length
+                    && nativeConversationCharCount(current) < nativeConversationCharCount(previousLogical) * 0.85;
+                contextWasCompacted = leadingRangeWasCompacted || conversationShrankSubstantially;
+                const tailOperation = operations.at(-1);
+                const tailMessages = tailOperation?.type === 'splice'
+                    && tailOperation.previous_start_index === previousLogical.length
+                    && tailOperation.delete_count === 0
+                    ? cloneNativeConversationMessages(operations.pop().insert_messages)
+                    : [];
+                const revisionMessage = buildConversationRevisionMessage(previousLogical, current, operations, revision);
+                wire = appendNativeConversationMessages(previousWire, [revisionMessage, ...tailMessages]);
+                if (current.at(-1)?.role === 'assistant' && wire.at(-1)?.role !== 'assistant') {
+                    wire = appendNativeConversationMessages(wire, [current.at(-1)]);
+                }
+                status = 'revised';
+                revisionOperations = operations.length;
+                appendedMessages = 1 + tailMessages.length;
+                appendedChars = nativeConversationCharCount([revisionMessage, ...tailMessages]);
+            }
+        }
+    }
+
+    const previousDynamicTexts = wirePrefixReused && Array.isArray(previous?.dynamicTexts)
+        ? previous.dynamicTexts
+        : null;
+    let dynamicJournal = appendUniversalDynamicContext(wire, dynamicLoreBlocks, previousDynamicTexts);
+    wire = dynamicJournal.messages;
+    appendedChars += dynamicJournal.appendedDynamicChars;
+    const deferredContextChars = deferredContextBlocks.reduce((sum, block) => sum + String(block?.text || '').length, 0);
+    wire = appendJournalContextBlocks(wire, deferredContextBlocks);
+    appendedChars += deferredContextChars;
+    if (status === 'reused' && (dynamicJournal.appendedDynamicChars > 0 || deferredContextChars > 0)) status = 'appended';
+
+    const wireSerializedChars = JSON.stringify(wire).length;
+    const currentSerializedChars = JSON.stringify(current).length
+        + dynamicJournal.currentTexts.reduce((sum, text) => sum + text.length, 0);
+    const journalIsBloated = wireSerializedChars > MAX_UNIVERSAL_CONVERSATION_JOURNAL_CHARS
+        && wireSerializedChars > currentSerializedChars * 1.25;
+    if (revision > MAX_UNIVERSAL_CONVERSATION_REVISIONS || journalIsBloated || contextWasCompacted) {
+        wire = current;
+        revision = 0;
+        epochHash = hashText(`${Date.now()}:${Math.random()}:${JSON.stringify(current)}`);
+        status = 'epoch-reset';
+        wirePrefixReused = false;
+        appendedMessages = current.length;
+        appendedChars = initialChars;
+        revisionOperations = 0;
+        dynamicJournal = appendUniversalDynamicContext(wire, dynamicLoreBlocks, null);
+        wire = dynamicJournal.messages;
+        appendedChars += dynamicJournal.appendedDynamicChars;
+        wire = appendJournalContextBlocks(wire, deferredContextBlocks);
+        appendedChars += deferredContextChars;
+    }
+
+    store[scope] = {
+        logicalMessages: current,
+        wireMessages: cloneNativeConversationMessages(wire),
+        dynamicTexts: dynamicJournal.currentTexts,
+        revision,
+        epochHash,
+        savedAt: Date.now(),
+    };
+    trimUniversalJournalScopes(store, scope);
+    saveUniversalConversationJournalStore(store);
+    return {
+        messages: wire,
+        epochHash,
+        status,
+        revision,
+        wirePrefixReused,
+        appendedMessages,
+        appendedChars,
+        revisionOperations,
+        dynamicLoreBlockCount: dynamicJournal.dynamicLoreBlockCount,
+        reusedDynamicBlocks: dynamicJournal.reusedDynamicBlocks,
+        appendedDynamicSuffixes: dynamicJournal.appendedDynamicSuffixes,
+        revisedDynamicBlocks: dynamicJournal.revisedDynamicBlocks,
+        removedDynamicBlocks: dynamicJournal.removedDynamicBlocks,
+        appendedDynamicChars: dynamicJournal.appendedDynamicChars,
+        incrementalWireReused: wirePrefixReused && previousDynamicTexts !== null,
+        deferredSystemChars: deferredContextChars,
+        contextWasCompacted,
+    };
+}
+
 function loadNativeUserCacheSnapshotStore() {
     if (nativeUserCacheSnapshotMemoryLoaded) return nativeUserCacheSnapshotMemory;
     nativeUserCacheSnapshotMemoryLoaded = true;
@@ -1060,13 +1709,163 @@ function restoreNativeUserSnapshots(messages, snapshots, currentUser) {
     return restored;
 }
 
-function appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks) {
-    if (!currentUser || !dynamicLoreBlocks.length) return 0;
-    const text = dynamicLoreBlocks
-        .map((block, index) => `<stch_dynamic_lore index="${index}">\n${String(block.text || '')}\n</stch_dynamic_lore>`)
-        .join('\n\n');
-    currentUser.content.push({ type: 'text', text });
-    return dynamicLoreBlocks.length;
+function fullDynamicContextBlock(text, index) {
+    return `<stch_dynamic_context index="${index}">\n${text}\n</stch_dynamic_context>`;
+}
+
+function revisedDynamicContextBlock(text, index) {
+    return [
+        `<stch_dynamic_context_revision index="${index}">`,
+        `Dynamic context ${index} above has changed. The following version is current and authoritative; ignore the earlier version where they differ.`,
+        text,
+        '</stch_dynamic_context_revision>',
+    ].join('\n');
+}
+
+function appendedDynamicContextBlock(text, index) {
+    return [
+        `<stch_dynamic_context_append index="${index}">`,
+        `Append the following content to dynamic context ${index} from the earlier cached journal. Together they form the current authoritative context.`,
+        text,
+        '</stch_dynamic_context_append>',
+    ].join('\n');
+}
+
+function removedDynamicContextBlock(index) {
+    return [
+        `<stch_dynamic_context_removed index="${index}">`,
+        `Dynamic context ${index} from the earlier cached request is no longer active. Ignore that earlier context.`,
+        '</stch_dynamic_context_removed>',
+    ].join('\n');
+}
+
+function appendUniversalDynamicContext(messages, dynamicLoreBlocks, previousTexts = null) {
+    const currentTexts = dynamicLoreBlocks.map(block => String(block?.text || ''));
+    const stats = {
+        dynamicLoreBlockCount: currentTexts.length,
+        reusedDynamicBlocks: 0,
+        appendedDynamicSuffixes: 0,
+        revisedDynamicBlocks: 0,
+        removedDynamicBlocks: 0,
+        appendedDynamicChars: 0,
+        currentTexts,
+    };
+    const wire = cloneNativeConversationMessages(messages);
+    const currentUser = [...wire].reverse().find(message => message?.role === 'user' && Array.isArray(message.content));
+    if (!currentUser) return { messages: wire, ...stats };
+
+    const previous = Array.isArray(previousTexts) ? previousTexts.map(String) : null;
+    const appendedParts = [];
+    if (!previous) {
+        for (let index = 0; index < currentTexts.length; index++) {
+            const text = fullDynamicContextBlock(currentTexts[index], index);
+            appendedParts.push({ type: 'text', text });
+            stats.appendedDynamicChars += text.length;
+        }
+    } else {
+        const count = Math.max(previous.length, currentTexts.length);
+        for (let index = 0; index < count; index++) {
+            const oldText = previous[index];
+            const currentText = currentTexts[index];
+            if (currentText === oldText) {
+                stats.reusedDynamicBlocks++;
+                continue;
+            }
+            if (currentText === undefined) {
+                const text = removedDynamicContextBlock(index);
+                appendedParts.push({ type: 'text', text });
+                stats.removedDynamicBlocks++;
+                stats.appendedDynamicChars += text.length;
+                continue;
+            }
+            if (oldText !== undefined && currentText.startsWith(oldText)) {
+                const suffix = currentText.slice(oldText.length);
+                if (suffix) {
+                    const text = appendedDynamicContextBlock(suffix, index);
+                    appendedParts.push({ type: 'text', text });
+                    stats.appendedDynamicSuffixes++;
+                    stats.appendedDynamicChars += text.length;
+                }
+                continue;
+            }
+            const text = oldText === undefined
+                ? fullDynamicContextBlock(currentText, index)
+                : revisedDynamicContextBlock(currentText, index);
+            appendedParts.push({ type: 'text', text });
+            if (oldText === undefined) stats.appendedDynamicSuffixes++;
+            else stats.revisedDynamicBlocks++;
+            stats.appendedDynamicChars += text.length;
+        }
+    }
+    currentUser.content.push(...appendedParts);
+    return { messages: wire, ...stats };
+}
+
+function appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks, previousSnapshot = null) {
+    const currentTexts = dynamicLoreBlocks.map(block => String(block?.text || ''));
+    const stats = {
+        dynamicLoreBlockCount: currentTexts.length,
+        reusedDynamicBlocks: 0,
+        appendedDynamicSuffixes: 0,
+        revisedDynamicBlocks: 0,
+        removedDynamicBlocks: 0,
+        appendedDynamicChars: 0,
+        incrementalWireReused: false,
+        currentTexts,
+    };
+    if (!currentUser || !Array.isArray(currentUser.content)) return stats;
+
+    const previousTexts = Array.isArray(previousSnapshot?.dynamicLoreTexts)
+        ? previousSnapshot.dynamicLoreTexts.map(String)
+        : null;
+    const canReuseWire = settings().universalIncrementalCache
+        && previousTexts
+        && Array.isArray(previousSnapshot?.content);
+
+    if (!canReuseWire) {
+        for (let index = 0; index < currentTexts.length; index++) {
+            const text = fullDynamicContextBlock(currentTexts[index], index);
+            currentUser.content.push({ type: 'text', text });
+            stats.appendedDynamicChars += text.length;
+        }
+        return stats;
+    }
+
+    currentUser.content = cloneNativeContentWithoutCacheControl(previousSnapshot.content);
+    stats.incrementalWireReused = true;
+    const count = Math.max(previousTexts.length, currentTexts.length);
+    for (let index = 0; index < count; index++) {
+        const previous = previousTexts[index];
+        const current = currentTexts[index];
+        if (current === previous) {
+            stats.reusedDynamicBlocks++;
+            continue;
+        }
+        if (current === undefined) {
+            const text = removedDynamicContextBlock(index);
+            currentUser.content.push({ type: 'text', text });
+            stats.removedDynamicBlocks++;
+            stats.appendedDynamicChars += text.length;
+            continue;
+        }
+        if (previous !== undefined && current.startsWith(previous)) {
+            const suffix = current.slice(previous.length);
+            if (suffix) {
+                currentUser.content.push({ type: 'text', text: suffix });
+                stats.appendedDynamicSuffixes++;
+                stats.appendedDynamicChars += suffix.length;
+            }
+            continue;
+        }
+        const text = previous === undefined
+            ? fullDynamicContextBlock(current, index)
+            : revisedDynamicContextBlock(current, index);
+        currentUser.content.push({ type: 'text', text });
+        if (previous === undefined) stats.appendedDynamicSuffixes++;
+        else stats.revisedDynamicBlocks++;
+        stats.appendedDynamicChars += text.length;
+    }
+    return stats;
 }
 
 function prepareNativeUserCacheSnapshots(messages, dynamicLoreBlocks, body, stableSystemHash) {
@@ -1082,9 +1881,11 @@ function prepareNativeUserCacheSnapshots(messages, dynamicLoreBlocks, body, stab
     const scope = nativeUserSnapshotScope(body, stableSystemHash);
     let snapshots = Array.isArray(store[scope]) ? store[scope] : [];
     const restoredUserSnapshots = restoreNativeUserSnapshots(messages, snapshots, currentUser);
-    const dynamicLoreBlockCount = appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks);
     const persistentText = nativeUserPersistentText(currentUser);
     const turnKey = nativeConversationTurnKey(messages, currentUser);
+    const existingIndex = snapshots.findIndex(item => item?.turnKey === turnKey);
+    const previousSnapshot = existingIndex >= 0 ? snapshots[existingIndex] : null;
+    const dynamicJournal = appendDynamicLoreToCurrentUser(currentUser, dynamicLoreBlocks, previousSnapshot);
     const continuation = isContinuationUserText(persistentText);
     let storedUserSnapshot = false;
 
@@ -1093,9 +1894,9 @@ function prepareNativeUserCacheSnapshots(messages, dynamicLoreBlocks, body, stab
             turnKey,
             persistentText,
             content: cloneNativeContentWithoutCacheControl(currentUser.content),
+            dynamicLoreTexts: dynamicJournal.currentTexts,
             savedAt: Date.now(),
         };
-        const existingIndex = snapshots.findIndex(item => item?.turnKey === turnKey);
         if (existingIndex >= 0) snapshots[existingIndex] = snapshot;
         else snapshots.push(snapshot);
         snapshots = trimNativeUserSnapshots(snapshots);
@@ -1104,7 +1905,8 @@ function prepareNativeUserCacheSnapshots(messages, dynamicLoreBlocks, body, stab
         storedUserSnapshot = true;
     }
 
-    return { restoredUserSnapshots, storedUserSnapshot, dynamicLoreBlockCount };
+    delete dynamicJournal.currentTexts;
+    return { restoredUserSnapshots, storedUserSnapshot, ...dynamicJournal };
 }
 
 function markLastNativeUserCacheBreakpoint(messages) {
@@ -1153,21 +1955,57 @@ function canUseNativeClaudeTransport(body) {
 
 function buildNativeClaudeRequest(body) {
     if (!canUseNativeClaudeTransport(body)) return null;
-    const system = buildNativeSystem(body.messages, body.model);
+    const system = buildNativeSystem(body.messages, body.model, body);
     if (!system || system.cacheBreakpointCount < 2) return null;
-    const messages = buildNativeMessages(body.messages, system.leadingSystemMessages, body.model);
+    let messages = buildNativeMessages(body.messages, system.leadingSystemMessages, body.model);
     if (!messages) return null;
-    const snapshotInfo = prepareNativeUserCacheSnapshots(
+    const useUniversalJournal = settings().universalIncrementalCache;
+    const userSideContext = useUniversalJournal
+        ? extractNativeUserSideContext(messages)
+        : { messages, contextBlocks: [], strippedHistoricalBlocks: 0 };
+    messages = userSideContext.messages;
+    const universalDynamicBlocks = [
+        ...(useUniversalJournal ? system.dynamicLoreBlocks : []),
+        ...userSideContext.contextBlocks,
+    ];
+    const snapshotInfo = useUniversalJournal
+        ? {
+            restoredUserSnapshots: 0,
+            storedUserSnapshot: false,
+            userSideContextBlockCount: userSideContext.contextBlocks.length,
+            strippedHistoricalUserContextBlocks: userSideContext.strippedHistoricalBlocks,
+        }
+        : prepareNativeUserCacheSnapshots(
+            messages,
+            system.dynamicLoreBlocks,
+            body,
+            system.stableSystemHash,
+        );
+    const conversationJournal = stabilizeUniversalConversationMessages(
         messages,
-        system.dynamicLoreBlocks,
         body,
         system.stableSystemHash,
+        universalDynamicBlocks,
+        useUniversalJournal ? system.deferredContextBlocks : [],
     );
+    messages = conversationJournal.messages;
+    if (useUniversalJournal) {
+        Object.assign(snapshotInfo, {
+            dynamicLoreBlockCount: conversationJournal.dynamicLoreBlockCount,
+            reusedDynamicBlocks: conversationJournal.reusedDynamicBlocks,
+            appendedDynamicSuffixes: conversationJournal.appendedDynamicSuffixes,
+            revisedDynamicBlocks: conversationJournal.revisedDynamicBlocks,
+            removedDynamicBlocks: conversationJournal.removedDynamicBlocks,
+            appendedDynamicChars: conversationJournal.appendedDynamicChars,
+            incrementalWireReused: conversationJournal.incrementalWireReused,
+        });
+    }
     // Claude Code also marks the newest user-side content block. Some Claude
     // gateways only activate extended-TTL caching when this message breakpoint
     // is present, even if the system blocks already carry ttl=1h.
     const messageCacheBreakpointCount = markLastNativeUserCacheBreakpoint(messages);
-    const cacheMetadata = nativeClaudeCacheMetadata(body, system.stableSystemHash);
+    const cacheEpochHash = hashText(`${system.stableSystemHash}\n${conversationJournal.epochHash}`);
+    const cacheMetadata = nativeClaudeCacheMetadata(body, cacheEpochHash);
 
     const tools = convertNativeTools(body.tools);
     const request = {
@@ -1190,6 +2028,17 @@ function buildNativeClaudeRequest(body) {
         systemCacheBreakpointCount: system.cacheBreakpointCount,
         messageCacheBreakpointCount,
         claudeCodeCompatPrefix: system.claudeCodeCompatPrefix,
+        universalSystemJournal: system.universalSystemJournal,
+        universalConversationJournal: {
+            status: conversationJournal.status,
+            revision: conversationJournal.revision,
+            wirePrefixReused: conversationJournal.wirePrefixReused,
+            appendedMessages: conversationJournal.appendedMessages,
+            appendedChars: conversationJournal.appendedChars,
+            revisionOperations: conversationJournal.revisionOperations,
+            deferredSystemChars: conversationJournal.deferredSystemChars,
+            contextWasCompacted: conversationJournal.contextWasCompacted,
+        },
         cacheSessionId: cacheMetadata.sessionId,
         ...snapshotInfo,
     };
@@ -1291,7 +2140,17 @@ function applyClaudeOneHourCache(body, nativeTransportEligible = true) {
             claudeCodeCompatPrefix: native.claudeCodeCompatPrefix,
             restoredUserSnapshots: native.restoredUserSnapshots,
             storedUserSnapshot: native.storedUserSnapshot,
+            userSideContextBlockCount: native.userSideContextBlockCount || 0,
+            strippedHistoricalUserContextBlocks: native.strippedHistoricalUserContextBlocks || 0,
             dynamicLoreBlockCount: native.dynamicLoreBlockCount,
+            reusedDynamicBlocks: native.reusedDynamicBlocks,
+            appendedDynamicSuffixes: native.appendedDynamicSuffixes,
+            revisedDynamicBlocks: native.revisedDynamicBlocks,
+            removedDynamicBlocks: native.removedDynamicBlocks,
+            appendedDynamicChars: native.appendedDynamicChars,
+            incrementalWireReused: native.incrementalWireReused,
+            universalSystemJournal: native.universalSystemJournal,
+            universalConversationJournal: native.universalConversationJournal,
             betaHeaders: [...CLAUDE_CACHE_BETA_HEADERS],
         };
     }
@@ -1744,11 +2603,16 @@ function patchBaiBaoKuDownstreamFetch() {
 function ensureFetchPatch(reason = 'manual') {
     const baiBaoKuPatched = patchBaiBaoKuDownstreamFetch();
     let globalPatched = false;
-    if (!window.fetch?.[FETCH_PATCH_META_KEY]) {
+    // The manifest loads this hook immediately after Request Monitor and before
+    // ordinary extensions. Later wrappers retain this function as their
+    // downstream fetch, so it observes their final request body. Re-wrapping the
+    // current window.fetch here would move us back outside those extensions and
+    // let them invalidate the optimized request after we processed it.
+    if (!window.__stCacheHelperFetchPatched) {
         window.fetch = createFetchPatch(window.fetch, FETCH_PATCH_ROLE_GLOBAL);
         globalPatched = true;
+        window.__stCacheHelperFetchPatched = true;
     }
-    window.__stCacheHelperFetchPatched = true;
     if (settings().log && (globalPatched || baiBaoKuPatched)) {
         console.debug('[ST Cache Helper] fetch patch ensured', { reason, globalPatched, baiBaoKuPatched });
     }
@@ -1766,9 +2630,8 @@ function installFetchPatch() {
         if (eventName) eventSource.on(eventName, () => ensureFetchPatch(eventName));
     }
 
-    // Some performance extensions install fetch wrappers asynchronously after
-    // EXTENSIONS_FIRST_LOAD. These bounded checks repair that late replacement
-    // without leaving a permanent polling timer behind.
+    // Revisit exposed downstream hooks installed asynchronously. The global
+    // hook itself remains at the bottom of the fetch chain.
     for (const delay of [1_000, 3_000, 10_000, 30_000, 60_000]) {
         setTimeout(() => ensureFetchPatch(`delayed-${delay}`), delay);
     }
@@ -1781,7 +2644,7 @@ function addPanel() {
     const html = `
     <div id="st_cache_helper_panel">
       <b>ST Cache Helper</b>
-      <div class="stch-muted">缓存修复插件。推荐使用“稳定前缀缓存修复”：把 ST 的中后段静态提示词提前为稳定前缀，避免 depth 注入块随对话轮次滑动导致 Claude prompt cache 只写不读。</div>
+      <div class="stch-muted">缓存修复插件。原生 1h 模式下会在最终 Claude 请求出口建立追加式 system、对话与动态上下文日志。</div>
       <label class="stch-row"><input id="stch_enabled" type="checkbox"> 启用请求修复</label>
       <div class="stch-row">
         <span>策略</span>
@@ -1807,6 +2670,7 @@ function addPanel() {
       <label class="stch-row"><input id="stch_claude_1h_cache" type="checkbox"> Claude 原生 1 小时缓存（Claude Code 方式）</label>
       <label class="stch-row"><input id="stch_claude_opus_compat" type="checkbox"> Opus 1h Claude Code 兼容前缀（带人格中和）</label>
       <label class="stch-row"><input id="stch_dynamic_lore_cache" type="checkbox"> 重建临时 user／选择性世界书缓存前缀</label>
+      <label class="stch-row"><input id="stch_universal_incremental" type="checkbox"> 全局最终请求增量日志（system／对话／动态注入）</label>
       <div class="stch-muted">仅处理自定义 OpenAI 中模型名含 Claude 的请求。启用后通过同一地址的 <code>/v1/messages</code> 原生协议发送，在稳定 system 前缀和最新 user 消息放置 <code>ttl=1h</code> 断点，并自动转换普通/流式响应。部分 Opus 运营商需要标准 Claude Code 前缀才接受 1h；兼容前缀后会立即加入中和说明，后续酒馆角色设定仍为权威人格。</div>
       <div class="stch-muted">世界书说明：只提升像长期设定/资料库的块；含“当前状态/本轮/最新”等动态状态栏会尽量留在原位，避免反而破坏缓存或剧情。</div>
       <div class="stch-muted">注意：这是前端请求级修复，不修改 ST 后端源码和 NewAPI。稳定前缀模式会清空 post-processing，原因是它已经把静态提示块固定到前缀，不能再让 ST 后端二次移动这些块。</div>
@@ -1872,6 +2736,10 @@ function addPanel() {
         settings().stabilizeDynamicLoreCache = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
+    $('#stch_universal_incremental').prop('checked', !!s.universalIncrementalCache).on('change', function () {
+        settings().universalIncrementalCache = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
 }
 
 function exposeDebug() {
@@ -1889,10 +2757,16 @@ function exposeDebug() {
         clearNativeUserCacheSnapshots() {
             nativeUserCacheSnapshotMemory = {};
             nativeUserCacheSnapshotMemoryLoaded = true;
+            universalSystemJournalMemory = {};
+            universalSystemJournalMemoryLoaded = true;
+            universalConversationJournalMemory = {};
+            universalConversationJournalMemoryLoaded = true;
             try {
                 if (typeof sessionStorage !== 'undefined') {
                     sessionStorage.removeItem(NATIVE_USER_CACHE_SNAPSHOTS_KEY);
                     sessionStorage.removeItem(LEGACY_NATIVE_USER_CACHE_SNAPSHOTS_KEY);
+                    sessionStorage.removeItem(UNIVERSAL_SYSTEM_JOURNAL_KEY);
+                    sessionStorage.removeItem(UNIVERSAL_CONVERSATION_JOURNAL_KEY);
                 }
             } catch { /* noop */ }
         },

@@ -1,13 +1,13 @@
 {
   "display_name": "ST Cache Helper",
-  "loading_order": 999,
+  "loading_order": -9999,
   "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
   "author": "Codex",
-  "version": "0.10.6",
-  "homePage": "https://local/st-cache-helper",
+  "version": "0.11.0",
+  "homePage": "https://github.com/haveagoodday1205-png/st-cache-helper",
   "hooks": {
     "activate": "init"
   }

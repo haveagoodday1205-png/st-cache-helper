@@ -4,14 +4,14 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 
 ## 核心功能
 
-本扩展会在浏览器前端拦截 SillyTavern 发往：
+本扩展会在浏览器前端的最终请求出口拦截 SillyTavern 发往：
 
 ```text
 /api/backends/chat-completions/generate
 /api/plugins/baibaoku/v1/chats/save-generate
 ```
 
-的请求，并在不修改 SillyTavern 后端源码、不修改 NewAPI 的情况下做缓存友好化处理。
+的请求，并在不修改 SillyTavern 后端源码、不修改 NewAPI 的情况下做缓存友好化处理。扩展加载在 Request Monitor 之后、普通功能扩展之前，因此后续扩展保存的底层 `fetch` 会先完成自己的注入或改道，再进入 Cache Helper；Request Monitor 看到的是优化后的最终请求。
 
 当前默认策略为：
 
@@ -21,6 +21,10 @@ SillyTavern 第三方前端扩展，用于改善 Claude / NewAPI 链路的 promp
 
 它会：
 
+- 在最终 Anthropic `system` 和 `messages` 上建立与插件名称无关的追加日志；
+- 普通增长只追加新楼层；旧消息被编辑、删除或重排时，只在尾部追加权威差分；
+- 将每轮重复的 user 侧注入块、选择性世界书和压缩历史变成全局上下文槽，相同内容不再反复发送；
+- system 改动通过首轮固定的日志协议在 conversation 尾部修订，使上一轮完整请求仍是下一轮前缀；
 - 把稳定的 `system` 提示词固定到请求最前面；
 - 把 ST 中后段静态提示词提前为稳定前缀，避免随聊天轮次滑动；
 - 自动识别并补回“预设里显示存在、但实际没进请求体”的自定义 `system_prompt: true` 提示词；
@@ -37,7 +41,7 @@ SillyTavern 的某些 OpenAI/Claude 预设组合下，常见问题是：
 - 某些导入预设的自定义 `system_prompt: true` 模块会显示在 Prompt Manager 里，但不会进入最终请求体；
 - 静态 assistant/user 提示词可能混在聊天历史后面，导致 Claude prompt cache 只写不读。
 
-本扩展的目标是让角色卡、世界书、长预设、样例等稳定前缀尽量保持一致，从而提高后续请求的 `cache_tokens`。
+本扩展的目标是让角色卡、世界书、长预设、样例和已经发送过的对话 wire 保持为不可变前缀，从而提高后续请求的 `cache_read_input_tokens`。
 
 ## 安装方法
 
@@ -72,6 +76,7 @@ st-cache-helper/
 给请求加调试头：开
 自动补回丢失的自定义 system 提示词：开
 Claude 原生 1 小时缓存（Claude Code 方式）：关
+全局增量缓存日志：开
 ```
 
 ## 验证是否生效
@@ -103,12 +108,24 @@ cache_creation.ephemeral_1h_input_tokens > 0
 
 后续相同稳定前缀应出现 `cache_read_input_tokens > 0`。
 
+控制台的 `universalSystemJournal` / `universalConversationJournal` 会显示本轮状态：
+
+```text
+created      首轮冷写
+reused       最终内容相同，直接复用 wire
+appended     只追加新楼层、后缀或上下文差分
+revised      旧内容改变，在尾部追加权威修订
+epoch-reset  修订日志达到容量边界，本轮重新冷写
+```
+
 ## 注意
 
 - 这是前端请求级修复。
 - 不修改 NewAPI。
 - 不修改 SillyTavern 后端源码。
-- 不能保证所有动态预设 100% 命中缓存；如果预设每轮把时间、随机数、summary、动态世界书放到前缀，仍可能降低缓存命中。
+- 真正新增或改变的内容仍需写入；全局日志避免的是把未变化的旧前缀一起重写。
+- 达到修订次数或日志容量边界时会开启新 epoch，允许一次冷写，避免无限保留已删除内容或超过模型上下文。
+- 只有最终仍经过 SillyTavern 标准生成 `fetch` 链或已支持的保存生成通道的请求才能处理；完全绕开 ST 网络栈的独立插件请求不在此扩展的出口上。
 
 
 ## 0.6.0
@@ -183,3 +200,14 @@ cache_creation.ephemeral_1h_input_tokens > 0
 - 该兼容路径会把上游原生 Claude 流暂时改为非流式 JSON，让 BaiBaoKu 后端能够正确解析并保存回复；返回浏览器时再恢复为 SillyTavern 请求的 OpenAI-compatible SSE 格式。
 - 修复并行加载扩展时 fetch hook 顺序不稳定，导致同一套设置有时写入 1 小时、有时退回默认 5 分钟的问题。
 - 修正动态块识别：`<observed_piece>`、记忆简报、时间锚点和本轮剧情指令留在 user 侧；大型稳定预设不再因为内部出现 `[RULE:]` 一类文本而被误判为动态块。连续两轮可读取稳定 system 前缀，仅重写本轮动态部分。
+
+## 0.11.0
+
+- 新增默认开启的全局最终请求增量日志，不按插件名称适配：在 Anthropic 原生请求生成完成后统一处理 `system`、conversation 和动态上下文。
+- 正常新楼层只追加 assistant/user；普通消息被编辑、删除、插入或重排时，保留旧 wire 并在尾部追加最小 conversation patch。
+- 首轮 system 加入固定日志协议；后续 system 增长或改写作为权威修订追加到 conversation 尾部，使上一轮完整 system + messages 仍保持为下一轮前缀。
+- user 消息第一个文本块保留为真实楼层，其余同角色注入块进入全局上下文槽；选择性 system 世界书、压缩历史和 user 侧重复注入只发送一次，变化时只追加后缀或修订。
+- 插件加载顺序改为 `-9999`：在 ST Request Monitor 之后、普通功能插件之前安装底层 fetch 出口，避免其他插件在 Cache Helper 处理完成后再次改写请求。
+- 全局日志按聊天、角色、模型和接口隔离；system 修订超过 8 次或累计约 600k 字符、conversation 修订超过 8 次或日志显著膨胀时自动开启新 epoch。
+- 使用此前 Request Monitor 导出的真实 4 轮请求回放：旧版每轮重复约 39k 动态上下文；新版首轮后第二轮只写真实变化的 1,128 字符，第三、第四轮重复动态写入均为 0，且每轮 wire 都完整保留上一轮前缀。
+- Haiku 4.5 真实网关验证：首轮 `ephemeral_1h_input_tokens=27,305`；第二轮读取 `27,305`、仅写 `14`；第三轮同时追加楼层并修改 system，仍读取 `27,319`、仅写 `85`。
